@@ -90,3 +90,60 @@ async def test_api_command_reads_content_length_body(fake_esl_server):
         assert reply.body == "+OK\n"
     finally:
         await transport.close()
+
+
+async def _run_slow_event_server(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, delay_seconds: float
+):
+    """Auth successfully, then stay silent for `delay_seconds` before sending
+    one CHANNEL_PARK event — models an idle ESL connection with no call
+    activity for longer than a short command-reply timeout."""
+    writer.write(b"Content-Type: auth/request\n\n")
+    await writer.drain()
+    await reader.readuntil(b"\n\n")  # auth <password>
+    writer.write(b"Content-Type: command/reply\nReply-Text: +OK accepted\n\n")
+    await writer.drain()
+
+    await reader.readuntil(b"\n\n")  # event json ...
+    writer.write(b"Content-Type: command/reply\nReply-Text: +OK\n\n")
+    await writer.drain()
+
+    await asyncio.sleep(delay_seconds)
+
+    body = b'{"Event-Name": "CHANNEL_PARK", "Unique-ID": "chan-1"}'
+    writer.write(
+        f"Content-Type: text/event-json\nContent-Length: {len(body)}\n\n".encode()
+        + body
+    )
+    await writer.drain()
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_events_does_not_time_out_during_idle_period():
+    """Regression test: events() must not apply the constructor's short
+    command-reply timeout while waiting for the next event — a real
+    FreeSWITCH connection with no in-progress calls can be idle far longer
+    than any reasonable command timeout without anything being wrong."""
+
+    async def handler(reader, writer):
+        await _run_slow_event_server(reader, writer, delay_seconds=0.3)
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    async with server:
+        # A command-reply timeout far shorter than the idle period below —
+        # if events() incorrectly applied this, it would raise well before
+        # the event arrives.
+        transport = ESLTransport(host, port, "ClueCon", timeout=0.1)
+        await transport.connect()
+        try:
+            await transport.subscribe("CHANNEL_PARK")
+            event = await asyncio.wait_for(
+                anext(transport.events()), timeout=2.0
+            )
+            assert event.get("Event-Name") == "CHANNEL_PARK"
+            assert event.get("Unique-ID") == "chan-1"
+        finally:
+            await transport.close()

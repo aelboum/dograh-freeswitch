@@ -128,11 +128,24 @@ separate upstream repo.
 - `api/tests/telephony/freeswitch/`
 - `api/tests/telephony/test_freeswitch_esl_manager.py`
 
-## Files touched outside this folder (the two sanctioned edits)
+## Files touched outside this folder
+
+The two sanctioned `providers/AGENTS.md` edits:
 
 - `api/services/telephony/providers/__init__.py` — one import line
 - `api/schemas/telephony_config.py` — one discriminated-union entry, one
   response field
+
+Plus one more, discovered at deployment time and not covered by that
+contract (which predates any provider needing a standalone background
+process): **`api/Dockerfile`'s entrypoint-scripts `COPY` list**, one line
+adding `./scripts/run_freeswitch_manager.sh`. This isn't optional — Docker
+images only contain files an explicit `COPY` names, and the pre-existing
+`ari` provider's `run_ari_manager.sh` needed the exact same treatment when
+*it* was added. Any standalone-process provider (one with its own
+`esl_manager.py`/`ari_manager.py`-style background worker, not just
+request/response HTTP handling) requires this fourth edit; providers with
+no such process (every other one in this repo except `ari`) don't.
 
 Nothing else. In particular: **no database migration.** `workflow_runs.mode`
 was converted from a Postgres enum to `VARCHAR(64)` in

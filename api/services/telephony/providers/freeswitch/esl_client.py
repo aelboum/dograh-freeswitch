@@ -23,6 +23,10 @@ from loguru import logger
 
 _AUTH_REQUEST_HEADER = "Content-Type: auth/request"
 
+# Sentinel distinguishing "use the constructor's default timeout" from an
+# explicit `timeout=None` ("wait indefinitely") in _read_frame's signature.
+_UNSET = object()
+
 
 @dataclass
 class ESLReply:
@@ -135,9 +139,17 @@ class ESLTransport:
 
     async def events(self) -> AsyncIterator[ESLEvent]:
         """Yield events as they arrive. Raises ESLConnectionClosed when the
-        socket closes so the caller's reconnect loop can react."""
+        socket closes so the caller's reconnect loop can react.
+
+        Waits indefinitely between events (``timeout=None``) — unlike a
+        command round-trip, there's no way to know how long until the next
+        real FreeSWITCH event arrives, and applying the constructor's
+        command-reply timeout here would spuriously "time out" (and trigger
+        a reconnect) during any idle period longer than it, even though the
+        connection is perfectly healthy.
+        """
         while True:
-            headers, body = await self._read_frame()
+            headers, body = await self._read_frame(timeout=None)
             content_type = headers.get("Content-Type", "")
             if content_type in ("auth/request",):
                 continue
@@ -157,23 +169,33 @@ class ESLTransport:
         headers, body = await self._read_frame()
         return ESLReply(headers=headers, body=body)
 
-    async def _read_frame(self) -> tuple[Dict[str, str], str]:
+    async def _read_frame(
+        self, *, timeout: "Optional[float] | object" = _UNSET
+    ) -> tuple[Dict[str, str], str]:
         """Read one header block (terminated by a blank line) plus any
-        Content-Length-declared body."""
+        Content-Length-declared body.
+
+        ``timeout`` defaults to the constructor's command-reply timeout;
+        pass ``None`` explicitly to wait indefinitely (used by :meth:`events`
+        for the next-event read, where no fixed deadline is meaningful).
+        """
         if self._reader is None:
             raise ESLConnectionClosed("ESL socket not connected")
-        raw_headers = await asyncio.wait_for(
-            self._reader.readuntil(b"\n\n"), timeout=self.timeout
-        )
-        headers = _parse_headers(raw_headers.decode(errors="replace"))
-        length = int(headers.get("Content-Length", "0") or 0)
-        body = ""
-        if length:
-            raw_body = await asyncio.wait_for(
-                self._reader.readexactly(length), timeout=self.timeout
-            )
-            body = raw_body.decode(errors="replace")
-        return headers, body
+        effective_timeout = self.timeout if timeout is _UNSET else timeout
+
+        async def _read() -> tuple[Dict[str, str], str]:
+            raw_headers = await self._reader.readuntil(b"\n\n")
+            headers = _parse_headers(raw_headers.decode(errors="replace"))
+            length = int(headers.get("Content-Length", "0") or 0)
+            body = ""
+            if length:
+                raw_body = await self._reader.readexactly(length)
+                body = raw_body.decode(errors="replace")
+            return headers, body
+
+        if effective_timeout is None:
+            return await _read()
+        return await asyncio.wait_for(_read(), timeout=effective_timeout)
 
 
 def _parse_headers(raw: str) -> Dict[str, str]:

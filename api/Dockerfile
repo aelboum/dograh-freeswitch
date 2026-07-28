@@ -157,6 +157,7 @@ COPY --chown=dograh:dograh \
      ./scripts/run_web.sh \
      ./scripts/run_arq_worker.sh \
      ./scripts/run_ari_manager.sh \
+     ./scripts/run_freeswitch_manager.sh \
      ./scripts/run_campaign_orchestrator.sh \
      ./scripts/drain_web.sh \
      ./scripts/

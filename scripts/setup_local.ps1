@@ -146,10 +146,10 @@ function Assert-PathExists([string]$Path, [string]$Message) {
 }
 
 Write-Info ''
-Write-Info '╔══════════════════════════════════════════════════════════════╗'
-Write-Info '║                    Dograh Local Setup                        ║'
-Write-Info '║       Local docker deployment, optional TURN server          ║'
-Write-Info '╚══════════════════════════════════════════════════════════════╝'
+Write-Info '=================================================================='
+Write-Info '                    Dograh Local Setup'
+Write-Info '       Local docker deployment, optional TURN server'
+Write-Info '=================================================================='
 Write-Info ''
 
 if ([string]::IsNullOrEmpty($env:ENABLE_COTURN)) {
@@ -230,7 +230,7 @@ if ($env:DOGRAH_SKIP_DOWNLOAD -ne '1') {
         Download-InitSupportBundle $CurrentDir 'main'
     }
 
-    Write-Success '✓ Deployment files downloaded'
+    Write-Success 'Deployment files downloaded'
 } else {
     Write-Info "[1/$TotalSteps] Using docker-compose.yaml in current directory"
 }
@@ -256,7 +256,7 @@ $envLines = @(
     "OSS_JWT_SECRET=$ossJwtSecret"
     ''
     '# PostgreSQL password. Used by the postgres container on first init and by'
-    "# the API's DATABASE_URL. Do not change after the first start — the password"
+    "# the API's DATABASE_URL. Do not change after the first start -- the password"
     '# is baked into the postgres data volume when it is first created.'
     "POSTGRES_PASSWORD=$postgresPassword"
     ''
@@ -288,14 +288,14 @@ if ($UseCoturn) {
 
 $envContent = ($envLines -join [Environment]::NewLine) + [Environment]::NewLine
 [System.IO.File]::WriteAllText((Join-Path $CurrentDir '.env'), $envContent, [System.Text.UTF8Encoding]::new($false))
-Write-Success '✓ .env file created'
+Write-Success '.env file created'
 
 Write-Host ''
-Write-Success '╔══════════════════════════════════════════════════════════════╗'
-Write-Success '║                    Setup Complete!                           ║'
-Write-Success '╚══════════════════════════════════════════════════════════════╝'
+Write-Success '=================================================================='
+Write-Success '                    Setup Complete!'
+Write-Success '=================================================================='
 Write-Host ''
-Write-Host "Files created in $CurrentDir:" -ForegroundColor Blue
+Write-Host "Files created in ${CurrentDir}:" -ForegroundColor Blue
 Write-Host '  - docker-compose.yaml'
 Write-Host '  - .env'
 if ($UseCoturn) {

@@ -1,0 +1,48 @@
+# Optional FreeSWITCH provider extension — additive only, no changes to
+# docker-compose.yaml. Adds a single service, dograh-freeswitch-manager,
+# that runs the standalone ESL event-listener process
+# (api/services/telephony/providers/freeswitch/esl_manager.py) connecting
+# OUT to an operator-run FreeSWITCH/FusionPBX box (container, VPS, or
+# existing install — this file does not run FreeSWITCH itself; see
+# api/services/telephony/providers/freeswitch/OPERATOR_GUIDE.md).
+#
+# Usage:
+#   docker compose -f docker-compose.yaml -f docker-compose.freeswitch.yml \
+#     --profile freeswitch up -d
+#
+# Dograh runs fine without this file. Enabling it does not change the
+# default (docker-compose.yaml-only) install in any way.
+
+services:
+  freeswitch-manager:
+    image: ${REGISTRY:-dograhai}/dograh-api:latest
+    container_name: dograh-freeswitch-manager
+    profiles: ["freeswitch"]
+    command: ["./scripts/run_freeswitch_manager.sh"]
+    environment:
+      ENVIRONMENT: "${ENVIRONMENT:-local}"
+      LOG_LEVEL: "INFO"
+
+      # Same endpoint-resolution vars as the api service — esl_manager.py
+      # calls get_backend_endpoints() to build the WebSocket URL FreeSWITCH's
+      # mod_audio_stream dials back to.
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-}"
+      PUBLIC_HOST: "${PUBLIC_HOST:-}"
+      BACKEND_API_ENDPOINT: "${BACKEND_API_ENDPOINT:-}"
+
+      DATABASE_URL: "postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres"
+      REDIS_URL: "redis://:${REDIS_PASSWORD:-redissecret}@redis:6379"
+
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET must be set to a strong secret}"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

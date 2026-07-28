@@ -20,6 +20,10 @@ from api.services.telephony.providers.cloudonix.config import (
     CloudonixConfigurationRequest,
     CloudonixConfigurationResponse,
 )
+from api.services.telephony.providers.freeswitch.config import (
+    FreeswitchConfigurationRequest,
+    FreeswitchConfigurationResponse,
+)
 from api.services.telephony.providers.plivo.config import (
     PlivoConfigurationRequest,
     PlivoConfigurationResponse,
@@ -48,6 +52,7 @@ TelephonyConfigRequest = Annotated[
     Union[
         ARIConfigurationRequest,
         CloudonixConfigurationRequest,
+        FreeswitchConfigurationRequest,
         PlivoConfigurationRequest,
         TelnyxConfigurationRequest,
         TwilioConfigurationRequest,
@@ -73,6 +78,7 @@ class TelephonyConfigurationResponse(BaseModel):
     cloudonix: Optional[CloudonixConfigurationResponse] = None
     ari: Optional[ARIConfigurationResponse] = None
     telnyx: Optional[TelnyxConfigurationResponse] = None
+    freeswitch: Optional[FreeswitchConfigurationResponse] = None
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +142,8 @@ __all__ = [
     "ARIConfigurationResponse",
     "CloudonixConfigurationRequest",
     "CloudonixConfigurationResponse",
+    "FreeswitchConfigurationRequest",
+    "FreeswitchConfigurationResponse",
     "PlivoConfigurationRequest",
     "PlivoConfigurationResponse",
     "TelephonyConfigRequest",

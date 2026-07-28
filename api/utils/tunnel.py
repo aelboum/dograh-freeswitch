@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import time
 from typing import Optional
 
 import aiohttp
@@ -10,6 +11,16 @@ from loguru import logger
 
 class TunnelURLProvider:
     """Provider for getting tunnel URLs from cloudflared service."""
+
+    # get_backend_endpoints() calls this on nearly every /api/v1/health request and
+    # every telephony webhook-URL construction. Deployments that never run the
+    # `tunnel` compose profile (no cloudflared service) would otherwise pay a live
+    # probe - and its full aiohttp timeout on failure - on every single call. Cache
+    # both hits and misses for a short TTL so repeated calls in that window are free.
+    _CACHE_TTL_SECONDS = 30
+    _cached_result: Optional[tuple[str, str]] = None
+    _cached_error: Optional[Exception] = None
+    _cached_at: float = 0.0
 
     @classmethod
     async def get_tunnel_urls(cls) -> tuple[str, str]:
@@ -22,19 +33,32 @@ class TunnelURLProvider:
         Raises:
             ValueError: If no tunnel URL can be determined
         """
+        now = time.monotonic()
+        if now - cls._cached_at < cls._CACHE_TTL_SECONDS:
+            if cls._cached_error is not None:
+                raise cls._cached_error
+            if cls._cached_result is not None:
+                return cls._cached_result
 
         try:
             # Try to get URL from cloudflared metrics
             urls = await cls._get_cloudflared_urls()
             if urls:
+                cls._cached_result = urls
+                cls._cached_error = None
+                cls._cached_at = now
                 return urls
         except Exception as e:
             logger.warning(f"Failed to get tunnel URL from cloudflared: {e}")
 
-        raise ValueError(
+        error = ValueError(
             "No tunnel URL available. Please set BACKEND_API_ENDPOINT environment "
             "variable or ensure cloudflared service is running."
         )
+        cls._cached_result = None
+        cls._cached_error = error
+        cls._cached_at = now
+        raise error
 
     @classmethod
     async def _get_cloudflared_urls(cls) -> Optional[tuple[str, str]]:

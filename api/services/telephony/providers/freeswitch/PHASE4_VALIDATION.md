@@ -131,20 +131,55 @@ Every step through "would send uuid_answer/uuid_audio_stream" was exercised for 
 against the real DB and real registered config (see Workflow status above) — only
 the final two ESL commands and the actual phone call were not sent/placed.
 
-## Remaining steps before real call testing
+## Phase 5 — real call results (2026-07-28, later same day)
 
-1. **Confirm the exact `Caller-Destination-Number` format FreeSWITCH delivers for
-   `723690372`.** The dialplan regex allows an optional `31` prefix
-   (`^(31)?723690372$`); if the carrier actually delivers `31723690372`, it will
-   normalize to `+31723690372` and **not** match the stored `+723690372` — this can
-   only be confirmed by an actual inbound call or by inspecting a live `CHANNEL_PARK`
-   event's `Caller-Destination-Number` field for this DID.
-2. **Pin an actual `mod_audio_stream` version-behavior check under a real call** —
-   the wire format was verified against source, but a real call is the first time
-   audio actually flows through `FreeswitchFrameSerializer` end-to-end.
-3. **Get a real destination number** for an outbound test call (a placeholder was
-   used above only to show command construction).
-4. **Place one real outbound call**, then **one real inbound call to 723690372**,
-   watching `docker logs dograh-freeswitch-manager` and the workflow run's transcript,
-   once you're ready — this report stops short of that per the instruction not to
-   place real calls yet.
+Both a real outbound and a real inbound call were placed and completed successfully.
+
+**Outbound** (`workflow_runs.id = 2`, to `+31643080655` via the real gateway):
+originated → answered → `mod_audio_stream` connected
+(`WebSocket /api/v1/telephony/ws/1/1/2 [accepted]`) → STT ("Connected to Flux") → TTS
+("Connected to Dograh TTS service") → real two-way LLM conversation → natural hangup
+→ recordings + transcript uploaded to MinIO → `state: completed`. Transcript excerpt:
+
+```
+assistant: Hello! I'm a test assistant, ready to help you out. How can I assist you today?
+user: Yes.
+assistant: Great! How can I help you today?
+```
+
+**Inbound** (`workflow_runs.id = 3`, real call to `723690372`): first attempt failed
+— the caller heard "the number you have dialed cannot be reached." Root cause,
+confirmed in `dograh-freeswitch-manager` logs, not a code bug:
+
+```
+[FreeSWITCH org=1] Inbound call to 31723690372 on channel ... — no matching phone number for config 1, hanging up
+```
+
+This resolved item 1 from the prior "remaining steps" list: the carrier delivers the
+destination as `31723690372` (with the `31` prefix), not bare `723690372` as
+originally assumed. The code correctly rejected an unrecognized number rather than
+misrouting it — the fix was data, not logic. Deleted phone number `id=1`
+(`+723690372`, address is immutable by design) and recreated it as `id=2` with
+`address: "+31723690372"` via the normal API. Second real inbound call attempt
+succeeded completely: matched the corrected binding → workflow run created → answered
+→ media attached → full AI conversation → natural hangup → transcript uploaded →
+`state: completed`. Transcript excerpt:
+
+```
+assistant: Hello! I'm a test assistant, ready to help you. How can I assist you today?
+user: Yes. Hello. You speak with Iman?
+assistant: Hello! I am an AI assistant, and I don't have a name like Iman. How can I help you today?
+user: My Internet connection does not work.
+assistant: I'm sorry to hear that you're having trouble with your internet connection. ...
+```
+
+**Conclusion: the FreeSWITCH provider works end-to-end against the real FusionPBX
+install, both directions, with real audio and a real conversation.** No further
+"remaining steps" from Phase 4 are outstanding. Two operationally-relevant notes for
+future installs, both worth folding into `OPERATOR_GUIDE.md`:
+
+- The exact `Caller-Destination-Number` format (with or without a country-code
+  prefix) is carrier/dialplan-specific and must be confirmed with a real test call
+  per install — don't assume the bare DID digits.
+- `address` on a `telephony_phone_numbers` row is immutable; fixing a wrong binding
+  means delete + recreate, not update.

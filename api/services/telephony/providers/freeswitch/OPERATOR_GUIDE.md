@@ -38,6 +38,20 @@ Dograh answers the channel itself once it resolves which workflow the
 called number maps to (via the phone number's `inbound_workflow_id` in
 Dograh's UI).
 
+**Confirmed gotcha, verified against a real install**: the destination number
+Dograh must bind the phone number to in the UI is whatever FreeSWITCH's
+`Caller-Destination-Number` actually contains for that DID — which may include
+a country-code prefix your dialplan regex tolerates but your DID string
+doesn't literally show. E.g. a dialplan matching `^(31)?723690372$` may still
+deliver `31723690372` (with the prefix) on real calls, not bare `723690372`.
+A phone number bound to the wrong form fails inbound routing silently from
+the caller's perspective (they just hear a generic "cannot be reached"
+message) — check `dograh-freeswitch-manager`'s logs for a
+`no matching phone number` warning showing the actual delivered number, and
+bind to that exact string. Note `address` on a phone number is immutable
+once created (by design) — fixing a wrong binding means deleting and
+recreating it, not editing it.
+
 ## 2. Outbound: configure `dial_prefix`
 
 `dial_prefix` in the Dograh telephony configuration form is prepended

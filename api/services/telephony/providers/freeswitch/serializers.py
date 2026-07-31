@@ -6,7 +6,7 @@ code inside this provider package instead of adding a file to pipecat's own
 upstream, a stricter isolation guarantee for this provider.
 
 Wire protocol confirmed against amigniter/mod_audio_stream's actual source
-(audio_streamer_glue.cpp, pinned to v1.0.3+), not just its README:
+(audio_streamer_glue.cpp), not just its README:
   - FreeSWITCH -> us: raw binary L16 PCM frames, no envelope (like Asterisk's
     chan_websocket, NOT like Twilio's base64-JSON). An optional single text
     frame carrying the verbatim `uuid_audio_stream start` metadata argument
@@ -16,10 +16,22 @@ Wire protocol confirmed against amigniter/mod_audio_stream's actual source
     "sampleRate": <rate>, "audioData": "<base64 L16 PCM>"}}.
 This asymmetry (raw binary in, JSON+base64 out) is a real property of the
 module, not an inconsistency in this file.
+
+Correction (verified against the actual open-source module, CMakeLists
+version 1.0.0, not the README's newer "commercial edition" claims): the
+module does NOT play `streamAudio` messages back onto the channel itself. It
+decodes each message to a temp file and fires a CUSTOM
+`mod_audio_stream::play` FreeSWITCH event carrying the file path — an
+external ESL listener is expected to catch that event and actually play the
+file (`esl_manager.py`'s `_handle_audio_stream_play` does this via
+`uuid_broadcast`). `playback_buffer_ms` below batches audio before sending
+specifically to keep the resulting broadcast rate low enough to sound smooth.
 """
 
+import asyncio
 import base64
 import json
+import time
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -33,6 +45,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     InterruptionFrame,
     StartFrame,
+    TTSStoppedFrame,
 )
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.utils.enums import EndTaskReason
@@ -57,11 +70,39 @@ class FreeswitchFrameSerializer(FrameSerializer):
                 `uuid_audio_stream start` command, defaults to 8000 Hz.
             sample_rate: Optional override for pipeline input sample rate.
             auto_hang_up: Whether to automatically terminate the channel on EndFrame.
+            playback_buffer_ms: How much outbound audio to accumulate before
+                emitting one `streamAudio` WS message. mod_audio_stream writes
+                each message to its own temp file and fires a CUSTOM event for
+                esl_manager to `uuid_broadcast` — at the pipeline's native
+                ~20-40ms frame size that's 25-50 broadcasts/sec, and each
+                broadcast's playback-setup overhead is audible as choppiness.
+                Batching trades a bit of latency for fewer, larger broadcasts.
+            priming_lead_ms: Extra audio held back before the *first* chunk
+                of a fresh utterance is sent, on top of playback_buffer_ms.
+                Measured on this exact deployment: a consistent, fixed ~100ms
+                silence gap appears between every chunk's playback ending and
+                the next one starting — the round-trip cost of buffer-full ->
+                WS message -> mod_audio_stream file write -> CUSTOM event ->
+                esl_manager pickup -> `uuid_broadcast`. Chunk N+1 is normally
+                only "ready" right as chunk N finishes, leaving zero slack to
+                absorb that cost, so it surfaces as an audible gap on *every*
+                chunk boundary regardless of playback_buffer_ms — a bigger
+                buffer only made gaps less frequent, never gap-free. Delaying
+                the first chunk of each utterance by one extra buffer's worth
+                front-loads a standing lead that comfortably covers the
+                measured ~100ms tax for every subsequent chunk in that
+                utterance, the standard jitter-buffer pre-roll trick.
+            priming_idle_reset_ms: Gap (no AudioRawFrame) after which the next
+                one is treated as starting a new utterance and re-primed,
+                rather than a continuation with an already-established lead.
         """
 
         freeswitch_sample_rate: int = 8000
         sample_rate: int | None = None
         auto_hang_up: bool = True
+        playback_buffer_ms: int = 250
+        priming_lead_ms: int = 350
+        priming_idle_reset_ms: int = 500
 
     def __init__(
         self,
@@ -107,6 +148,16 @@ class FreeswitchFrameSerializer(FrameSerializer):
         self._hangup_attempted = False
         self._transfer_attempted = False
 
+        self._playback_buffer = bytearray()
+        self._playback_buffer_threshold_bytes = int(
+            self._freeswitch_sample_rate * 2 * self._params.playback_buffer_ms / 1000
+        )
+        self._priming_lead_bytes = int(
+            self._freeswitch_sample_rate * 2 * self._params.priming_lead_ms / 1000
+        )
+        self._priming = True
+        self._last_audio_activity: float | None = None
+
     async def setup(self, frame: StartFrame):
         """Sets up the serializer with pipeline configuration."""
         self._sample_rate = self._params.sample_rate or frame.audio_in_sample_rate
@@ -125,59 +176,135 @@ class FreeswitchFrameSerializer(FrameSerializer):
             frame_reason = getattr(frame, "reason", None)
             logger.debug(f"Processing {type(frame).__name__} with reason: {frame_reason}")
 
-            if (
+            # The playback buffer may still hold up to playback_buffer_ms of
+            # the final utterance (e.g. the tail of "have a nice day") since
+            # AudioRawFrames are batched rather than sent immediately. Flush
+            # it now — it's returned below so the transport actually sends
+            # it — and give FreeSWITCH time to play it out before the
+            # hangup/transfer strategy tears the channel down.
+            pending_audio = self._flush_playback_buffer()
+
+            # Decide + claim which action to run synchronously (same
+            # attempted-flag guard as before) so a second EndFrame/CancelFrame
+            # arriving before the deferred task below has run can't race into
+            # running the same strategy twice. Only the awaiting of the
+            # strategy itself — and the delay to let pending_audio play out —
+            # is deferred.
+            do_transfer = (
                 frame_reason == EndTaskReason.TRANSFER_CALL.value
                 and not self._transfer_attempted
-            ):
-                self._transfer_attempted = True
-                if self._transfer_strategy:
-                    success = await self._transfer_strategy.execute_transfer(
-                        self._strategy_context()
-                    )
-                    if not success:
-                        logger.error(f"Transfer strategy failed for channel {self._channel_id}")
-                else:
-                    logger.warning(
-                        f"No transfer strategy configured for channel {self._channel_id}"
-                    )
-                return None
-            elif (
-                self._params.auto_hang_up
+            )
+            do_hangup = (
+                not do_transfer
+                and self._params.auto_hang_up
                 and not self._hangup_attempted
                 and frame_reason != EndTaskReason.TRANSFER_CALL.value
-            ):
+            )
+            if do_transfer:
+                self._transfer_attempted = True
+            elif do_hangup:
                 self._hangup_attempted = True
-                if self._hangup_strategy:
-                    success = await self._hangup_strategy.execute_hangup(
-                        self._strategy_context()
-                    )
-                    if not success:
-                        logger.error(f"Hangup strategy failed for channel {self._channel_id}")
-                else:
-                    logger.warning(f"No hangup strategy configured for channel {self._channel_id}")
-                return None
+
+            async def _finalize():
+                if pending_audio is not None:
+                    await asyncio.sleep(self._params.playback_buffer_ms / 1000)
+
+                if do_transfer:
+                    if self._transfer_strategy:
+                        success = await self._transfer_strategy.execute_transfer(
+                            self._strategy_context()
+                        )
+                        if not success:
+                            logger.error(
+                                f"Transfer strategy failed for channel {self._channel_id}"
+                            )
+                    else:
+                        logger.warning(
+                            f"No transfer strategy configured for channel {self._channel_id}"
+                        )
+                elif do_hangup:
+                    if self._hangup_strategy:
+                        success = await self._hangup_strategy.execute_hangup(
+                            self._strategy_context()
+                        )
+                        if not success:
+                            logger.error(
+                                f"Hangup strategy failed for channel {self._channel_id}"
+                            )
+                    else:
+                        logger.warning(
+                            f"No hangup strategy configured for channel {self._channel_id}"
+                        )
+
+            if do_transfer or do_hangup:
+                asyncio.create_task(_finalize())
+            return pending_audio
         elif isinstance(frame, InterruptionFrame):
             # mod_audio_stream has no documented "clear playback" WS command;
             # returning None stops us from sending more audio, same as ari/.
+            # Also drop anything already buffered so it doesn't leak out
+            # after the barge-in as a stale trailing chunk, and re-prime so
+            # the next utterance (after this interruption) rebuilds its lead
+            # from scratch rather than assuming one still exists.
+            self._playback_buffer.clear()
+            self._priming = True
+            self._last_audio_activity = None
             return None
+        elif isinstance(frame, TTSStoppedFrame):
+            # Guaranteed by TTSService for every normally-completed utterance
+            # (base-class fallback if the backend doesn't emit its own; see
+            # _handle_audio_context in pipecat's tts_service.py), and skipped
+            # only on interruption — which InterruptionFrame above already
+            # handles by clearing instead. Flush whatever's left under the
+            # playback_buffer_ms threshold so the tail of the utterance isn't
+            # stranded until the next one starts (or dropped by the next
+            # InterruptionFrame).
+            return self._flush_playback_buffer()
         elif isinstance(frame, AudioRawFrame):
+            now = time.monotonic()
+            if (
+                self._last_audio_activity is not None
+                and (now - self._last_audio_activity) * 1000
+                > self._params.priming_idle_reset_ms
+            ):
+                # No audio for a while — this is a new utterance (e.g. the
+                # next agent turn), not a continuation, so it no longer has
+                # the standing lead built up during the previous one.
+                self._priming = True
+            self._last_audio_activity = now
+
             resampled = await self._output_resampler.resample(
                 frame.audio, frame.sample_rate, self._freeswitch_sample_rate
             )
             if resampled is None or len(resampled) == 0:
                 return None
 
-            message = {
-                "type": "streamAudio",
-                "data": {
-                    "audioDataType": "raw",
-                    "sampleRate": self._freeswitch_sample_rate,
-                    "audioData": base64.b64encode(resampled).decode("ascii"),
-                },
-            }
-            return json.dumps(message)
+            self._playback_buffer.extend(resampled)
+            required = self._playback_buffer_threshold_bytes + (
+                self._priming_lead_bytes if self._priming else 0
+            )
+            if len(self._playback_buffer) < required:
+                return None
+
+            self._priming = False
+            return self._flush_playback_buffer()
 
         return None
+
+    def _flush_playback_buffer(self) -> str | None:
+        if not self._playback_buffer:
+            return None
+        chunk = bytes(self._playback_buffer)
+        self._playback_buffer.clear()
+        message = {
+            "type": "streamAudio",
+            "data": {
+                "audioDataType": "raw",
+                "sampleRate": self._freeswitch_sample_rate,
+                "audioData": base64.b64encode(chunk).decode("ascii"),
+            },
+        }
+        return json.dumps(message)
 
     async def deserialize(self, data: str | bytes) -> Frame | None:
         """Deserializes FreeSWITCH mod_audio_stream WebSocket data to Pipecat frames.

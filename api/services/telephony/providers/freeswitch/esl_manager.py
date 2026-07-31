@@ -53,7 +53,11 @@ _TRACKED_EVENTS = (
     "CHANNEL_ANSWER",
     "CHANNEL_HANGUP",
     "CHANNEL_HANGUP_COMPLETE",
+    "CUSTOM",
+    "mod_audio_stream::play",
 )
+
+_AUDIO_STREAM_PLAY_SUBCLASS = "mod_audio_stream::play"
 
 
 class ESLConnection:
@@ -78,6 +82,7 @@ class ESLConnection:
         self.audio_bridge_module = audio_bridge_module
 
         self._transport: Optional[ESLTransport] = None
+        self._playback_transport: Optional[ESLTransport] = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._reconnect_delay = 1
@@ -131,6 +136,9 @@ class ESLConnection:
         self._running = False
         if self._transport:
             await self._transport.close()
+        if self._playback_transport:
+            await self._playback_transport.close()
+            self._playback_transport = None
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -200,6 +208,11 @@ class ESLConnection:
             await self._handle_channel_answer(channel_id, event)
         elif event_name in ("CHANNEL_HANGUP", "CHANNEL_HANGUP_COMPLETE"):
             await self._handle_channel_hangup(channel_id, event)
+        elif (
+            event_name == "CUSTOM"
+            and event.get("Event-Subclass") == _AUDIO_STREAM_PLAY_SUBCLASS
+        ):
+            await self._handle_audio_stream_play(channel_id, event)
 
     async def _handle_channel_park(self, channel_id: str, event: ESLEvent):
         """A channel just entered our control (park). This is the unified
@@ -420,6 +433,63 @@ class ESLConnection:
         transport = ESLTransport(self.host, self.port, self.esl_password)
         await transport.connect()
         return transport
+
+    async def _get_playback_transport(self) -> ESLTransport:
+        """Persistent connection for `uuid_broadcast` playback commands.
+
+        Unlike `_connect_control` (fine for one-off answer/hangup calls),
+        TTS chunks arrive roughly every 40ms — reconnecting per chunk would
+        add a full connect+auth round trip to every playback command, badly
+        degrading (or outright breaking) real-time audio.
+        """
+        if self._playback_transport is None or not self._playback_transport.connected:
+            self._playback_transport = ESLTransport(
+                self.host, self.port, self.esl_password
+            )
+            await self._playback_transport.connect()
+        return self._playback_transport
+
+    async def _handle_audio_stream_play(self, channel_id: str, event: ESLEvent):
+        """mod_audio_stream (community edition) doesn't play TTS audio back
+        onto the channel itself — it writes each decoded chunk to a temp
+        file and fires this CUSTOM event carrying the file path, expecting
+        an external listener to act on it. We're that listener: turn the
+        notification into actual audio via `uuid_broadcast`.
+        """
+        raw_body = event.get("_body")
+        if not raw_body:
+            return
+
+        import json
+
+        try:
+            payload = json.loads(raw_body)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                f"[FreeSWITCH org={self.organization_id}] Unparseable "
+                f"{_AUDIO_STREAM_PLAY_SUBCLASS} body for channel {channel_id}: "
+                f"{raw_body[:200]}"
+            )
+            return
+
+        file_path = payload.get("file")
+        if not file_path:
+            return
+
+        try:
+            transport = await self._get_playback_transport()
+            reply = await transport.api(f"uuid_broadcast {channel_id} {file_path} aleg")
+            if not reply.ok:
+                logger.warning(
+                    f"[FreeSWITCH org={self.organization_id}] uuid_broadcast failed "
+                    f"for channel {channel_id}, file {file_path}: {reply.error_text}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[FreeSWITCH org={self.organization_id}] Playback transport error "
+                f"for channel {channel_id}: {e}"
+            )
+            self._playback_transport = None
 
     async def _answer(self, channel_id: str):
         transport = await self._connect_control()

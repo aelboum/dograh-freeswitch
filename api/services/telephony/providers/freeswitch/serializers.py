@@ -50,6 +50,8 @@ from pipecat.frames.frames import (
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.utils.enums import EndTaskReason
 
+from .esl_client import ESLTransport
+
 if TYPE_CHECKING:
     from pipecat.serializers.call_strategies import HangupStrategy, TransferStrategy
 
@@ -240,15 +242,21 @@ class FreeswitchFrameSerializer(FrameSerializer):
                 asyncio.create_task(_finalize())
             return pending_audio
         elif isinstance(frame, InterruptionFrame):
-            # mod_audio_stream has no documented "clear playback" WS command;
-            # returning None stops us from sending more audio, same as ari/.
-            # Also drop anything already buffered so it doesn't leak out
-            # after the barge-in as a stale trailing chunk, and re-prime so
-            # the next utterance (after this interruption) rebuilds its lead
-            # from scratch rather than assuming one still exists.
+            # Dropping our own buffer only stops audio not yet sent — chunks
+            # already flushed to mod_audio_stream have already been
+            # uuid_broadcast'd by esl_manager (possibly several, queued,
+            # since each broadcast is subject to FreeSWITCH's own lead-frame
+            # delay) and keep playing on the channel regardless. Clearing the
+            # buffer alone is not a barge-in: the bot keeps talking. Actually
+            # stop the channel's current + queued playback via `uuid_break
+            # ... all` (mirrors the fresh-connection-per-command pattern
+            # strategies.py uses for uuid_kill/uuid_bridge — interruptions
+            # are far less frequent than audio chunks, so this doesn't need
+            # esl_manager's persistent playback connection).
             self._playback_buffer.clear()
             self._priming = True
             self._last_audio_activity = None
+            asyncio.create_task(self._break_playback())
             return None
         elif isinstance(frame, TTSStoppedFrame):
             # Guaranteed by TTSService for every normally-completed utterance
@@ -305,6 +313,28 @@ class FreeswitchFrameSerializer(FrameSerializer):
             },
         }
         return json.dumps(message)
+
+    async def _break_playback(self):
+        """Stops current + queued playback on the channel via `uuid_break ... all`.
+
+        Fire-and-forget from serialize() so a live interruption isn't held up
+        waiting on this ESL round trip.
+        """
+        try:
+            transport = ESLTransport(self._host, int(self._port), self._esl_password)
+            await transport.connect()
+            try:
+                reply = await transport.api(f"uuid_break {self._channel_id} all")
+                if not reply.ok:
+                    logger.warning(
+                        f"uuid_break failed for channel {self._channel_id}: {reply.error_text}"
+                    )
+            finally:
+                await transport.close()
+        except Exception as e:
+            logger.warning(
+                f"Failed to break FreeSWITCH playback for channel {self._channel_id}: {e}"
+            )
 
     async def deserialize(self, data: str | bytes) -> Frame | None:
         """Deserializes FreeSWITCH mod_audio_stream WebSocket data to Pipecat frames.

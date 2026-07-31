@@ -175,6 +175,13 @@ constraint) was the entire change needed there.
   Sufficient for connecting the caller to an answered destination; a
   fancier warm-transfer UX (announce-then-bridge, hold music, etc.) can be
   layered on later without changing `transfer_call`'s public contract.
+- **Barge-in stops playback via `uuid_break <channel> all`.** On
+  `InterruptionFrame`, `serializers.py` clears its own not-yet-sent buffer
+  *and* issues `uuid_break ... all` over a fresh, fire-and-forget
+  `ESLTransport` (same one-off-connection pattern `strategies.py` uses for
+  `uuid_kill`/`uuid_bridge`) — clearing the local buffer alone only stops
+  *future* chunks; audio already handed off is already playing on the
+  channel and needs an explicit break to actually stop.
 - **The hand-rolled ESL client (`esl_client.py`) is intentionally minimal** —
   only `auth`/`api`/`bgapi`/event-subscription, no full ESL feature set — so
   it can be swapped for a maintained library (e.g. Genesis) later without

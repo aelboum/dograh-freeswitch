@@ -16,8 +16,17 @@ class TunnelURLProvider:
     # every telephony webhook-URL construction. Deployments that never run the
     # `tunnel` compose profile (no cloudflared service) would otherwise pay a live
     # probe - and its full aiohttp timeout on failure - on every single call. Cache
-    # both hits and misses for a short TTL so repeated calls in that window are free.
+    # both hits and misses so repeated calls in that window are free.
+    #
+    # The miss TTL is deliberately much longer than the hit TTL: "no cloudflared
+    # service configured" is a static fact about a deployment (it doesn't flip
+    # true/false minute to minute the way a tunnel's assigned hostname could in
+    # principle change), so there's no reason to re-pay the live-probe timeout
+    # every 30s on a box that will never have one. Measured on a real FreeSWITCH
+    # inbound call: this cache going cold between calls was directly responsible
+    # for a ~4s stall between uuid_answer and uuid_audio_stream start.
     _CACHE_TTL_SECONDS = 30
+    _ERROR_CACHE_TTL_SECONDS = 600
     _cached_result: Optional[tuple[str, str]] = None
     _cached_error: Optional[Exception] = None
     _cached_at: float = 0.0
@@ -34,12 +43,22 @@ class TunnelURLProvider:
             ValueError: If no tunnel URL can be determined
         """
         now = time.monotonic()
-        if now - cls._cached_at < cls._CACHE_TTL_SECONDS:
+        ttl = (
+            cls._ERROR_CACHE_TTL_SECONDS
+            if cls._cached_error is not None
+            else cls._CACHE_TTL_SECONDS
+        )
+        if now - cls._cached_at < ttl:
             if cls._cached_error is not None:
+                logger.debug(
+                    "Using cached tunnel-lookup failure "
+                    f"(age={now - cls._cached_at:.0f}s) - skipping live probe"
+                )
                 raise cls._cached_error
             if cls._cached_result is not None:
                 return cls._cached_result
 
+        logger.debug("Tunnel-lookup cache cold or expired - probing cloudflared")
         try:
             # Try to get URL from cloudflared metrics
             urls = await cls._get_cloudflared_urls()

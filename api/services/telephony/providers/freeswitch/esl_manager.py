@@ -20,6 +20,7 @@ from api.logging_config import setup_logging
 
 setup_logging()
 import asyncio
+import time
 from typing import Dict, Optional, Set
 
 import redis.asyncio as aioredis
@@ -58,6 +59,21 @@ _TRACKED_EVENTS = (
 )
 
 _AUDIO_STREAM_PLAY_SUBCLASS = "mod_audio_stream::play"
+
+# mod_audio_stream's internal outbound-audio ring buffer defaults to a single
+# 20ms frame (STREAM_BUFFER_SIZE channel var unset => rtp_packets=1 => 320
+# bytes) — real playback needs slack to absorb normal delivery jitter, or the
+# module's write thread silently skips ticks (no audio, not even silence)
+# whenever the buffer runs dry between our WS sends. Must be set via
+# uuid_setvar before uuid_audio_stream start (read once, at attach time, to
+# size a fixed ring buffer) and must be a multiple of 20 (ms).
+_STREAM_BUFFER_SIZE_MS = 200
+
+# Minimum time (seconds) an inbound caller hears ringback (uuid_ring_ready)
+# before we answer. The existing async setup (DID/workflow lookup, quota
+# check, workflow-run creation) already consumes some of this window itself,
+# so we only sleep for whatever's left of it — not a flat added delay.
+_TARGET_RING_SECONDS = 3.0
 
 
 class ESLConnection:
@@ -264,11 +280,31 @@ class ESLConnection:
         while ringing (documented in OPERATOR_GUIDE.md) — this mirrors ARI's
         Stasis-app dialplan prerequisite. We then explicitly answer the
         channel ourselves, same as ARI's `_answer_channel` step.
+
+        Before any of that: send `uuid_ring_ready` immediately so the caller
+        hears normal ringback instead of silence while the lookups below
+        run, then top up to `_TARGET_RING_SECONDS` of ring time (not a flat
+        added delay — the lookups already consume part of that window).
+        Confirmed via live SIP trace that FreeSWITCH otherwise sends only
+        100 Trying followed directly by 200 OK, with no 180/183 in between.
         """
         caller_number = event.get("Caller-Caller-ID-Number", "unknown")
         called_number = event.get("Caller-Destination-Number", "unknown")
         concurrency_slot = None
         workflow_run = None
+
+        park_received_at = time.monotonic()
+        try:
+            await self._ring_ready(channel_id)
+            logger.info(
+                f"[FreeSWITCH org={self.organization_id}] Inbound call "
+                f"{channel_id} sending ringback"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[FreeSWITCH org={self.organization_id}] Failed to send "
+                f"ring_ready for channel {channel_id}: {e}"
+            )
 
         try:
             phone_row = await db_client.find_active_phone_number_for_inbound(
@@ -362,6 +398,16 @@ class ESLConnection:
                 return
 
             await self._set_channel_run(channel_id, str(workflow_run.id))
+
+            elapsed = time.monotonic() - park_received_at
+            if elapsed < _TARGET_RING_SECONDS:
+                await asyncio.sleep(_TARGET_RING_SECONDS - elapsed)
+            logger.info(
+                f"[FreeSWITCH org={self.organization_id}] Inbound call "
+                f"{channel_id} answering after "
+                f"{time.monotonic() - park_received_at:.2f}s ring duration"
+            )
+
             await self._answer(channel_id)
             await self._attach_media(channel_id, workflow_run.id, inbound_workflow_id)
 
@@ -414,6 +460,15 @@ class ESLConnection:
 
         transport = await self._connect_control()
         try:
+            setvar_reply = await transport.api(
+                f"uuid_setvar {channel_id} STREAM_BUFFER_SIZE {_STREAM_BUFFER_SIZE_MS}"
+            )
+            if not setvar_reply.ok:
+                logger.warning(
+                    f"[FreeSWITCH org={self.organization_id}] Failed to set "
+                    f"STREAM_BUFFER_SIZE on {channel_id}: {setvar_reply.error_text}"
+                )
+
             command = (
                 f"uuid_audio_stream {channel_id} start {ws_url} mono 8000 "
                 f"dograh-run-{workflow_run_id}"
@@ -490,6 +545,13 @@ class ESLConnection:
                 f"for channel {channel_id}: {e}"
             )
             self._playback_transport = None
+
+    async def _ring_ready(self, channel_id: str):
+        transport = await self._connect_control()
+        try:
+            await transport.api(f"uuid_ring_ready {channel_id}")
+        finally:
+            await transport.close()
 
     async def _answer(self, channel_id: str):
         transport = await self._connect_control()

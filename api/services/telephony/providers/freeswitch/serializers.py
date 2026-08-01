@@ -17,15 +17,49 @@ Wire protocol confirmed against amigniter/mod_audio_stream's actual source
 This asymmetry (raw binary in, JSON+base64 out) is a real property of the
 module, not an inconsistency in this file.
 
-Correction (verified against the actual open-source module, CMakeLists
-version 1.0.0, not the README's newer "commercial edition" claims): the
-module does NOT play `streamAudio` messages back onto the channel itself. It
-decodes each message to a temp file and fires a CUSTOM
-`mod_audio_stream::play` FreeSWITCH event carrying the file path — an
-external ESL listener is expected to catch that event and actually play the
-file (`esl_manager.py`'s `_handle_audio_stream_play` does this via
-`uuid_broadcast`). `playback_buffer_ms` below batches audio before sending
-specifically to keep the resulting broadcast rate low enough to sound smooth.
+The open-source community edition (CMakeLists version 1.0.0) does NOT play
+`streamAudio` messages back onto the channel itself — it decodes each
+message to a temp file and fires a CUSTOM `mod_audio_stream::play`
+FreeSWITCH event for an external ESL listener to `uuid_broadcast`.
+
+**This box currently runs a different build**: the voxcom-us fork
+(github.com/voxcom-us/mod_audio_stream), which instead writes decoded audio
+directly into a per-channel ring buffer (`write_sbuffer`) drained in
+real-time (one 20ms frame per tick) by its own write thread — no temp file,
+no CUSTOM event, no `uuid_broadcast` round trip. Confirmed by reading its
+`audio_streamer_glue.cpp` on the box directly. Since it never fires
+`mod_audio_stream::play` for raw-PCM `streamAudio` messages (the only
+message shape Dograh sends), `esl_manager.py`'s `_handle_audio_stream_play`/
+persistent playback connection is dead code *for this specific module
+build* — left in place because it's still correct for the community
+edition, which a different operator's box may run.
+
+That ring buffer defaults to just one 20ms frame of capacity
+(`STREAM_BUFFER_SIZE` channel var unset), so the write thread silently skips
+a tick — no audio, not even silence — whenever it runs dry between our WS
+sends. `esl_manager.py` sets `STREAM_BUFFER_SIZE=200` (ms) via `uuid_setvar`
+before `uuid_audio_stream start` to give it real slack. On the Dograh side,
+this means audio should be forwarded close to real-time as the pipeline
+produces it (see `AudioRawFrame` handling below) rather than batched into
+large client-side chunks — large infrequent bursts starve the ring buffer
+between sends, which is exactly what caused a live call to go silent in
+long, repeating gaps (2026-08-01).
+
+Not batching client-side is necessary but not sufficient, though: pipecat's
+`BaseOutputTransport` (`transports/base_output.py`) does not itself pace
+audio frames to real-time — it forwards each `TTSAudioRawFrame` downstream
+as fast as the TTS backend streams it (confirmed by reading
+`_audio_task_handler`/`_next_frame`, no real-time sleep in the no-mixer
+path this provider uses). A TTS backend streaming faster than real-time
+(common — audio often generates quicker than it plays) would otherwise let
+Dograh get arbitrarily far ahead: every `streamAudio` message already
+handed to FreeSWITCH is data it will play regardless of a later
+`InterruptionFrame` (no clean way to claw it back — see the
+`InterruptionFrame` branch below), so getting far ahead of real-time
+silently defeats barge-in even though playback itself sounds fine. `_pace`
+below throttles our own send rate to at most `playback_lead_ms` ahead of
+real-time, which both keeps FreeSWITCH's small ring buffer fed *and* bounds
+how much audio can possibly be "already committed" at interruption time.
 """
 
 import asyncio
@@ -45,12 +79,9 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     InterruptionFrame,
     StartFrame,
-    TTSStoppedFrame,
 )
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.utils.enums import EndTaskReason
-
-from .esl_client import ESLTransport
 
 if TYPE_CHECKING:
     from pipecat.serializers.call_strategies import HangupStrategy, TransferStrategy
@@ -72,39 +103,25 @@ class FreeswitchFrameSerializer(FrameSerializer):
                 `uuid_audio_stream start` command, defaults to 8000 Hz.
             sample_rate: Optional override for pipeline input sample rate.
             auto_hang_up: Whether to automatically terminate the channel on EndFrame.
-            playback_buffer_ms: How much outbound audio to accumulate before
-                emitting one `streamAudio` WS message. mod_audio_stream writes
-                each message to its own temp file and fires a CUSTOM event for
-                esl_manager to `uuid_broadcast` — at the pipeline's native
-                ~20-40ms frame size that's 25-50 broadcasts/sec, and each
-                broadcast's playback-setup overhead is audible as choppiness.
-                Batching trades a bit of latency for fewer, larger broadcasts.
-            priming_lead_ms: Extra audio held back before the *first* chunk
-                of a fresh utterance is sent, on top of playback_buffer_ms.
-                Measured on this exact deployment: a consistent, fixed ~100ms
-                silence gap appears between every chunk's playback ending and
-                the next one starting — the round-trip cost of buffer-full ->
-                WS message -> mod_audio_stream file write -> CUSTOM event ->
-                esl_manager pickup -> `uuid_broadcast`. Chunk N+1 is normally
-                only "ready" right as chunk N finishes, leaving zero slack to
-                absorb that cost, so it surfaces as an audible gap on *every*
-                chunk boundary regardless of playback_buffer_ms — a bigger
-                buffer only made gaps less frequent, never gap-free. Delaying
-                the first chunk of each utterance by one extra buffer's worth
-                front-loads a standing lead that comfortably covers the
-                measured ~100ms tax for every subsequent chunk in that
-                utterance, the standard jitter-buffer pre-roll trick.
-            priming_idle_reset_ms: Gap (no AudioRawFrame) after which the next
-                one is treated as starting a new utterance and re-primed,
-                rather than a continuation with an already-established lead.
+            hangup_grace_ms: Delay before running the hangup/transfer strategy
+                on EndFrame/CancelFrame, so the last already-sent audio (still
+                draining out of mod_audio_stream's own playback buffer, see
+                module docstring) isn't cut off mid-word. Matches
+                esl_manager.py's STREAM_BUFFER_SIZE.
+            playback_lead_ms: Maximum amount of audio (by playback duration)
+                we allow ourselves to send ahead of real-time. See module
+                docstring for why this matters beyond just avoiding
+                mod_audio_stream buffer underruns: it also bounds how much
+                audio can be "already committed" to play at the moment an
+                InterruptionFrame arrives. Kept close to esl_manager.py's
+                STREAM_BUFFER_SIZE (slightly above it, for jitter margin).
         """
 
         freeswitch_sample_rate: int = 8000
         sample_rate: int | None = None
         auto_hang_up: bool = True
-        playback_buffer_ms: int = 250
-        priming_lead_ms: int = 350
-        priming_idle_reset_ms: int = 500
+        hangup_grace_ms: int = 200
+        playback_lead_ms: int = 250
 
     def __init__(
         self,
@@ -150,15 +167,11 @@ class FreeswitchFrameSerializer(FrameSerializer):
         self._hangup_attempted = False
         self._transfer_attempted = False
 
-        self._playback_buffer = bytearray()
-        self._playback_buffer_threshold_bytes = int(
-            self._freeswitch_sample_rate * 2 * self._params.playback_buffer_ms / 1000
-        )
-        self._priming_lead_bytes = int(
-            self._freeswitch_sample_rate * 2 * self._params.priming_lead_ms / 1000
-        )
-        self._priming = True
-        self._last_audio_activity: float | None = None
+        # Monotonic time at which audio already sent will finish playing,
+        # i.e. how far ahead of real-time we currently are. None means "not
+        # currently pacing" (start of call, or just reset by an
+        # InterruptionFrame/idle gap).
+        self._playback_deadline: float | None = None
 
     async def setup(self, frame: StartFrame):
         """Sets up the serializer with pipeline configuration."""
@@ -178,20 +191,12 @@ class FreeswitchFrameSerializer(FrameSerializer):
             frame_reason = getattr(frame, "reason", None)
             logger.debug(f"Processing {type(frame).__name__} with reason: {frame_reason}")
 
-            # The playback buffer may still hold up to playback_buffer_ms of
-            # the final utterance (e.g. the tail of "have a nice day") since
-            # AudioRawFrames are batched rather than sent immediately. Flush
-            # it now — it's returned below so the transport actually sends
-            # it — and give FreeSWITCH time to play it out before the
-            # hangup/transfer strategy tears the channel down.
-            pending_audio = self._flush_playback_buffer()
-
-            # Decide + claim which action to run synchronously (same
-            # attempted-flag guard as before) so a second EndFrame/CancelFrame
-            # arriving before the deferred task below has run can't race into
-            # running the same strategy twice. Only the awaiting of the
-            # strategy itself — and the delay to let pending_audio play out —
-            # is deferred.
+            # Decide + claim which action to run synchronously (attempted-flag
+            # guard) so a second EndFrame/CancelFrame arriving before the
+            # deferred task below has run can't race into running the same
+            # strategy twice. Only the awaiting of the strategy itself — and
+            # the grace delay for already-sent audio to drain out of
+            # mod_audio_stream's own playback buffer — is deferred.
             do_transfer = (
                 frame_reason == EndTaskReason.TRANSFER_CALL.value
                 and not self._transfer_attempted
@@ -208,8 +213,8 @@ class FreeswitchFrameSerializer(FrameSerializer):
                 self._hangup_attempted = True
 
             async def _finalize():
-                if pending_audio is not None:
-                    await asyncio.sleep(self._params.playback_buffer_ms / 1000)
+                if self._params.hangup_grace_ms > 0:
+                    await asyncio.sleep(self._params.hangup_grace_ms / 1000)
 
                 if do_transfer:
                     if self._transfer_strategy:
@@ -240,101 +245,64 @@ class FreeswitchFrameSerializer(FrameSerializer):
 
             if do_transfer or do_hangup:
                 asyncio.create_task(_finalize())
-            return pending_audio
-        elif isinstance(frame, InterruptionFrame):
-            # Dropping our own buffer only stops audio not yet sent — chunks
-            # already flushed to mod_audio_stream have already been
-            # uuid_broadcast'd by esl_manager (possibly several, queued,
-            # since each broadcast is subject to FreeSWITCH's own lead-frame
-            # delay) and keep playing on the channel regardless. Clearing the
-            # buffer alone is not a barge-in: the bot keeps talking. Actually
-            # stop the channel's current + queued playback via `uuid_break
-            # ... all` (mirrors the fresh-connection-per-command pattern
-            # strategies.py uses for uuid_kill/uuid_bridge — interruptions
-            # are far less frequent than audio chunks, so this doesn't need
-            # esl_manager's persistent playback connection).
-            self._playback_buffer.clear()
-            self._priming = True
-            self._last_audio_activity = None
-            asyncio.create_task(self._break_playback())
             return None
-        elif isinstance(frame, TTSStoppedFrame):
-            # Guaranteed by TTSService for every normally-completed utterance
-            # (base-class fallback if the backend doesn't emit its own; see
-            # _handle_audio_context in pipecat's tts_service.py), and skipped
-            # only on interruption — which InterruptionFrame above already
-            # handles by clearing instead. Flush whatever's left under the
-            # playback_buffer_ms threshold so the tail of the utterance isn't
-            # stranded until the next one starts (or dropped by the next
-            # InterruptionFrame).
-            return self._flush_playback_buffer()
+        elif isinstance(frame, InterruptionFrame):
+            # mod_audio_stream has no documented "clear playback" WS command,
+            # and its `flush` ESL API command only discards audio still in
+            # transit — the currently-loaded fork build has its actual
+            # buffer-zeroing step disabled (see module docstring), so it
+            # wouldn't cut off audio already sitting in the module's own
+            # playback buffer anyway. Stopping here — not sending more — is
+            # sufficient *because* AudioRawFrame handling below paces sends
+            # to at most playback_lead_ms ahead of real-time: whatever's
+            # "already committed" at this point is bounded by that margin,
+            # not by however far ahead the TTS backend happened to stream.
+            # Reset pacing so the next utterance doesn't inherit a stale
+            # deadline from the one just cut off.
+            self._playback_deadline = None
+            return None
         elif isinstance(frame, AudioRawFrame):
-            now = time.monotonic()
-            if (
-                self._last_audio_activity is not None
-                and (now - self._last_audio_activity) * 1000
-                > self._params.priming_idle_reset_ms
-            ):
-                # No audio for a while — this is a new utterance (e.g. the
-                # next agent turn), not a continuation, so it no longer has
-                # the standing lead built up during the previous one.
-                self._priming = True
-            self._last_audio_activity = now
-
             resampled = await self._output_resampler.resample(
                 frame.audio, frame.sample_rate, self._freeswitch_sample_rate
             )
             if resampled is None or len(resampled) == 0:
                 return None
 
-            self._playback_buffer.extend(resampled)
-            required = self._playback_buffer_threshold_bytes + (
-                self._priming_lead_bytes if self._priming else 0
-            )
-            if len(self._playback_buffer) < required:
-                return None
+            await self._pace(len(resampled))
 
-            self._priming = False
-            return self._flush_playback_buffer()
+            message = {
+                "type": "streamAudio",
+                "data": {
+                    "audioDataType": "raw",
+                    "sampleRate": self._freeswitch_sample_rate,
+                    "audioData": base64.b64encode(resampled).decode("ascii"),
+                },
+            }
+            return json.dumps(message)
 
         return None
 
-    def _flush_playback_buffer(self) -> str | None:
-        if not self._playback_buffer:
-            return None
-        chunk = bytes(self._playback_buffer)
-        self._playback_buffer.clear()
-        message = {
-            "type": "streamAudio",
-            "data": {
-                "audioDataType": "raw",
-                "sampleRate": self._freeswitch_sample_rate,
-                "audioData": base64.b64encode(chunk).decode("ascii"),
-            },
-        }
-        return json.dumps(message)
+    async def _pace(self, resampled_byte_count: int):
+        """Sleeps just enough to keep our send rate within playback_lead_ms
+        of real-time, then accounts for the chunk about to be sent.
 
-    async def _break_playback(self):
-        """Stops current + queued playback on the channel via `uuid_break ... all`.
-
-        Fire-and-forget from serialize() so a live interruption isn't held up
-        waiting on this ESL round trip.
+        See module docstring: pipecat's output transport doesn't do this
+        pacing itself, so without it we could hand FreeSWITCH arbitrarily
+        more audio than it's actually played, which both risks overrunning
+        mod_audio_stream's tiny ring buffer and makes InterruptionFrame
+        unable to bound how much audio is already "committed".
         """
-        try:
-            transport = ESLTransport(self._host, int(self._port), self._esl_password)
-            await transport.connect()
-            try:
-                reply = await transport.api(f"uuid_break {self._channel_id} all")
-                if not reply.ok:
-                    logger.warning(
-                        f"uuid_break failed for channel {self._channel_id}: {reply.error_text}"
-                    )
-            finally:
-                await transport.close()
-        except Exception as e:
-            logger.warning(
-                f"Failed to break FreeSWITCH playback for channel {self._channel_id}: {e}"
-            )
+        now = time.monotonic()
+        deadline = max(self._playback_deadline or now, now)
+        lead = deadline - now
+        allowed_lead = self._params.playback_lead_ms / 1000
+        if lead > allowed_lead:
+            await asyncio.sleep(lead - allowed_lead)
+            deadline = time.monotonic() + allowed_lead
+
+        # L16 mono: 2 bytes/sample.
+        duration_secs = resampled_byte_count / (self._freeswitch_sample_rate * 2)
+        self._playback_deadline = deadline + duration_secs
 
     async def deserialize(self, data: str | bytes) -> Frame | None:
         """Deserializes FreeSWITCH mod_audio_stream WebSocket data to Pipecat frames.

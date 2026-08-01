@@ -175,13 +175,32 @@ constraint) was the entire change needed there.
   Sufficient for connecting the caller to an answered destination; a
   fancier warm-transfer UX (announce-then-bridge, hold music, etc.) can be
   layered on later without changing `transfer_call`'s public contract.
-- **Barge-in stops playback via `uuid_break <channel> all`.** On
-  `InterruptionFrame`, `serializers.py` clears its own not-yet-sent buffer
-  *and* issues `uuid_break ... all` over a fresh, fire-and-forget
-  `ESLTransport` (same one-off-connection pattern `strategies.py` uses for
-  `uuid_kill`/`uuid_bridge`) — clearing the local buffer alone only stops
-  *future* chunks; audio already handed off is already playing on the
-  channel and needs an explicit break to actually stop.
+- **Barge-in (`InterruptionFrame`) just stops sending, no ESL call.**
+  `uuid_break` (tried first) is a no-op against the fork's direct
+  write-thread playback path (see `serializers.py` module docstring for the
+  full mod_audio_stream-build story); its `uuid_audio_stream ... flush` API
+  command would work but risks the module getting stuck permanently
+  discarding audio if the reset condition (a non-`streamAudio` WS message)
+  is never sent — not worth the risk for the residual it would save, since
+  `serializers.py` bounds how far ahead of real-time it ever sends (next
+  bullet), so at most `playback_lead_ms` is ever "ahead" at interruption
+  time.
+- **No client-side audio batching, but real-time-paced sending — not the
+  same thing.** Previously batched into 250-950ms chunks to amortize the
+  community edition's fixed-cost `uuid_broadcast`; the fork actually loaded
+  on the current dev box drains a small internal ring buffer in real-time
+  instead (`esl_manager.py` sizes it via `STREAM_BUFFER_SIZE`), so batching
+  client-side only starves it between sends — this caused a real live call
+  to go silent in long, repeating gaps (2026-08-01, root-caused via direct
+  box access, see `serializers.py`'s module docstring). Removing batching
+  alone wasn't sufficient, though: pipecat's output transport doesn't pace
+  audio to real-time on its own, so a fast-streaming TTS backend could still
+  hand FreeSWITCH several seconds of audio well before it's actually played
+  — already-sent audio can't be recalled on interruption, so getting far
+  ahead silently defeats barge-in even though playback sounds fine.
+  `serializers.py`'s `_pace()` throttles sends to at most `playback_lead_ms`
+  ahead of real-time (a small sleep when exceeded), which both keeps the
+  ring buffer fed and bounds the interruption residual.
 - **The hand-rolled ESL client (`esl_client.py`) is intentionally minimal** —
   only `auth`/`api`/`bgapi`/event-subscription, no full ESL feature set — so
   it can be swapped for a maintained library (e.g. Genesis) later without

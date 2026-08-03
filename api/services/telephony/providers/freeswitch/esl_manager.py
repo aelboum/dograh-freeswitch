@@ -34,6 +34,7 @@ from api.services.call_concurrency import (
     call_concurrency,
 )
 from api.services.quota_service import authorize_workflow_run_start
+from api.services.telephony.call_answer_latency import record_call_answered
 from api.services.telephony.call_transfer_manager import get_call_transfer_manager
 from api.services.telephony.providers.freeswitch.esl_client import (
     ESLEvent,
@@ -73,7 +74,12 @@ _STREAM_BUFFER_SIZE_MS = 200
 # before we answer. The existing async setup (DID/workflow lookup, quota
 # check, workflow-run creation) already consumes some of this window itself,
 # so we only sleep for whatever's left of it — not a flat added delay.
-_TARGET_RING_SECONDS = 3.0
+#
+# Was 3.0: the calling carrier's SBC (call-id prefix "SBC...") was cancelling
+# inbound INVITEs right around that mark, so _answer() consistently lost the
+# race and every call failed with "No such channel" (ORIGINATOR_CANCEL just
+# before answer). Lowered to leave real margin against that timeout.
+_TARGET_RING_SECONDS = 1.0
 
 
 class ESLConnection:
@@ -409,6 +415,13 @@ class ESLConnection:
             )
 
             await self._answer(channel_id)
+            try:
+                await record_call_answered(workflow_run.id, channel_id)
+            except Exception as e:
+                logger.warning(
+                    f"[FreeSWITCH org={self.organization_id}] Failed to record "
+                    f"call-answer latency timestamp for channel {channel_id}: {e}"
+                )
             await self._attach_media(channel_id, workflow_run.id, inbound_workflow_id)
 
         except Exception as e:
@@ -432,6 +445,13 @@ class ESLConnection:
         `originate`'s destination app runs on answer)."""
         try:
             await self._set_channel_run(channel_id, workflow_run_id)
+            try:
+                await record_call_answered(workflow_run_id, channel_id)
+            except Exception as e:
+                logger.warning(
+                    f"[FreeSWITCH org={self.organization_id}] Failed to record "
+                    f"call-answer latency timestamp for channel {channel_id}: {e}"
+                )
             await db_client.update_workflow_run(
                 run_id=int(workflow_run_id),
                 gathered_context={"call_id": channel_id},

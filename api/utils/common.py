@@ -136,8 +136,12 @@ async def get_backend_endpoints() -> tuple[str, str]:
     Get the backend endpoint URLs for external access (webhooks, callbacks, WebSocket connections).
 
     Priority:
-        1. BACKEND_API_ENDPOINT environment variable (if set and not localhost)
-        2. Cloudflared Tunnel URLs (fallback for localhost or missing env var)
+        1. BACKEND_API_ENDPOINT environment variable, used as-is whenever set —
+           including a private/local address. An operator who explicitly
+           configured this value has already asserted it's reachable by their
+           telephony/webhook callers (e.g. FreeSWITCH on the same LAN); a
+           cloudflared tunnel is neither required nor consulted in that case.
+        2. Cloudflared Tunnel URLs — only when BACKEND_API_ENDPOINT is unset.
 
     Protocol Handling:
         1. If URL has http:// - returns http:// and ws://
@@ -157,28 +161,6 @@ async def get_backend_endpoints() -> tuple[str, str]:
         _validate_url(BACKEND_API_ENDPOINT)
 
     if BACKEND_API_ENDPOINT:
-        # Non-public address (localhost or a private/reserved IP) - the host isn't
-        # reachable from the internet, so prefer a running Cloudflare tunnel's URL.
-        if is_local_or_private_url(BACKEND_API_ENDPOINT):
-            logger.debug(
-                f"BACKEND_API_ENDPOINT is not publicly reachable ({BACKEND_API_ENDPOINT}), checking tunnel URL"
-            )
-            try:
-                tunnel_urls = await TunnelURLProvider.get_tunnel_urls()
-                if tunnel_urls:
-                    logger.debug(
-                        f"Tunnel URLs available, using tunnel URLs instead of localhost"
-                    )
-                    return tunnel_urls
-                else:
-                    logger.debug(
-                        f"Tunnel URLs returned None, proceeding with localhost endpoint"
-                    )
-            except Exception as e:
-                logger.debug(
-                    f"No tunnel URLs available ({e}), proceeding with localhost endpoint"
-                )
-
         try:
             # Parse the URL to validate and handle protocol
             scheme = get_scheme(BACKEND_API_ENDPOINT)

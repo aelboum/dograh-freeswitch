@@ -148,28 +148,45 @@ class TestGetBackendEndpointsWithEnvVar:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "env_url",
+        "env_url,expected_http,expected_ws",
         [
-            "http://localhost",
-            "http://localhost/",
-            "http://localhost:8000",
-            "http://localhost:8000/",
-            "localhost",
-            "localhost/",
-            "localhost:8000",
-            "localhost:8000/",
-            "http://127.0.0.1",
-            "http://127.0.0.1/",
-            "http://127.0.0.1:8000",
-            "http://127.0.0.1:8000/",
-            "127.0.0.1",
-            "127.0.0.1/",
-            "127.0.0.1:8000",
-            "127.0.0.1:8000/",
+            ("http://localhost", "http://localhost", "ws://localhost"),
+            ("http://localhost/", "http://localhost", "ws://localhost"),
+            ("http://localhost:8000", "http://localhost:8000", "ws://localhost:8000"),
+            (
+                "http://localhost:8000/",
+                "http://localhost:8000",
+                "ws://localhost:8000",
+            ),
+            ("localhost", "http://localhost", "ws://localhost"),
+            ("localhost/", "http://localhost", "ws://localhost"),
+            ("localhost:8000", "http://localhost:8000", "ws://localhost:8000"),
+            ("localhost:8000/", "http://localhost:8000", "ws://localhost:8000"),
+            ("http://127.0.0.1", "http://127.0.0.1", "ws://127.0.0.1"),
+            ("http://127.0.0.1/", "http://127.0.0.1", "ws://127.0.0.1"),
+            (
+                "http://127.0.0.1:8000",
+                "http://127.0.0.1:8000",
+                "ws://127.0.0.1:8000",
+            ),
+            (
+                "http://127.0.0.1:8000/",
+                "http://127.0.0.1:8000",
+                "ws://127.0.0.1:8000",
+            ),
+            ("127.0.0.1", "http://127.0.0.1", "ws://127.0.0.1"),
+            ("127.0.0.1/", "http://127.0.0.1", "ws://127.0.0.1"),
+            ("127.0.0.1:8000", "http://127.0.0.1:8000", "ws://127.0.0.1:8000"),
+            ("127.0.0.1:8000/", "http://127.0.0.1:8000", "ws://127.0.0.1:8000"),
         ],
     )
-    async def test_localhost_urls_with_tunnel_available(self, env_url):
-        """Test localhost/127.0.0.1 URLs prefer tunnel when available."""
+    async def test_localhost_urls_used_as_is_even_with_tunnel_available(
+        self, env_url, expected_http, expected_ws
+    ):
+        """An explicitly configured BACKEND_API_ENDPOINT wins immediately, even
+        when it's a local/private address and a tunnel is available - the
+        tunnel is never consulted in that case (see Phase 1 of the startup
+        latency fix: the tunnel probe was adding ~4s to every cold start)."""
         tunnel_http = "https://abc123.trycloudflare.com"
         tunnel_ws = "wss://abc123.trycloudflare.com"
 
@@ -180,8 +197,9 @@ class TestGetBackendEndpointsWithEnvVar:
             ) as mock_tunnel:
                 mock_tunnel.return_value = (tunnel_http, tunnel_ws)
                 http_url, ws_url = await get_backend_endpoints()
-                assert http_url == tunnel_http
-                assert ws_url == tunnel_ws
+                assert http_url == expected_http
+                assert ws_url == expected_ws
+                mock_tunnel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_localhost_tunnel_exception_falls_back(self):

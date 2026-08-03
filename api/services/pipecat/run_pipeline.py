@@ -1106,6 +1106,10 @@ async def _run_pipeline_impl(
 
         @task.user_bot_latency_observer.event_handler("on_latency_measured")
         async def on_latency_measured(observer, latency_seconds):
+            logger.info(
+                f"[turn-latency run={workflow_run_id}] user stopped speaking -> "
+                f"bot started speaking: {latency_seconds * 1000:.0f}ms"
+            )
             message = {
                 "type": RealtimeFeedbackType.LATENCY_MEASURED.value,
                 "payload": {
@@ -1128,6 +1132,13 @@ async def _run_pipeline_impl(
                 await in_memory_logs_buffer.append(message)
             except Exception as e:
                 logger.error(f"Failed to append latency to logs buffer: {e}")
+
+        @task.user_bot_latency_observer.event_handler("on_latency_breakdown")
+        async def on_latency_breakdown(observer, breakdown):
+            logger.info(
+                f"[turn-latency-breakdown run={workflow_run_id}] "
+                f"{breakdown.model_dump_json(exclude_none=True)}"
+            )
 
     # Register turn log handlers for all call types (WebRTC and telephony)
     register_turn_log_handlers(

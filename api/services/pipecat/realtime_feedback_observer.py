@@ -33,6 +33,7 @@ from api.services.pipecat.realtime_feedback_events import (
     build_ttfb_metric_event,
     build_user_transcription_event,
 )
+from api.services.pipecat import startup_latency
 
 if TYPE_CHECKING:
     from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
@@ -86,17 +87,21 @@ class RealtimeFeedbackObserver(BaseObserver):
         self,
         ws_sender: Callable[[dict], Awaitable[None]],
         logs_buffer: Optional["InMemoryLogsBuffer"] = None,
+        workflow_run_id: Optional[int] = None,
     ):
         """
         Args:
             ws_sender: Async function to send messages over WebSocket.
                        Expected signature: async def send(message: dict) -> None
             logs_buffer: Optional InMemoryLogsBuffer to persist events for post-call analysis.
+            workflow_run_id: Used only to attribute STT/LLM/TTS TTFB checkpoints to this
+                call's startup-latency breakdown (see startup_latency.mark).
         """
         super().__init__()
         self._ws_sender = ws_sender
         self._logs_buffer = logs_buffer
         self._frames_seen: Set[str] = set()
+        self._workflow_run_id = workflow_run_id
 
     async def cleanup(self):
         """Clean up resources. Must be called when the observer is no longer needed."""
@@ -225,6 +230,17 @@ class RealtimeFeedbackObserver(BaseObserver):
             # Check if this MetricsFrame contains TTFB data from an LLM processor
             for metric_data in frame.data:
                 if isinstance(metric_data, TTFBMetricsData):
+                    # Startup-latency breakdown: mark() is first-occurrence-wins,
+                    # so across a whole call this only ever records turn 1's TTFB
+                    # for each service type - exactly what startup latency needs.
+                    if self._workflow_run_id is not None and metric_data.processor:
+                        if "STT" in metric_data.processor:
+                            startup_latency.mark(self._workflow_run_id, "stt_ttfb")
+                        elif "TTS" in metric_data.processor:
+                            startup_latency.mark(self._workflow_run_id, "tts_ttfb")
+                        elif "LLM" in metric_data.processor:
+                            startup_latency.mark(self._workflow_run_id, "llm_ttfb")
+
                     # Only send TTFB if it's from an LLM processor
                     if metric_data.processor and "LLM" in metric_data.processor:
                         await self._send_message(

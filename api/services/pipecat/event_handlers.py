@@ -13,6 +13,7 @@ from api.services.pipecat.in_memory_buffers import (
     InMemoryRecordingBuffers,
 )
 from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggregator
+from api.services.pipecat import startup_latency
 from api.services.pipecat.tracing_config import get_trace_url
 from api.services.pipecat.transcript_log_coordinator import TranscriptLogCoordinator
 from api.services.posthog_client import capture_event
@@ -112,6 +113,7 @@ def register_event_handlers(
             and not ready_state["initial_response_triggered"]
         ):
             ready_state["initial_response_triggered"] = True
+            startup_latency.mark(workflow_run_id, "pipeline_and_client_ready")
 
             asyncio.create_task(
                 _capture_call_event(
@@ -141,6 +143,7 @@ def register_event_handlers(
                         await ringer_task
                 else:
                     fetch_result = pre_call_fetch_task.result()
+                startup_latency.mark(workflow_run_id, "pre_call_fetch_done")
 
                 if fetch_result:
                     engine._call_context_vars.update(fetch_result)
@@ -159,15 +162,18 @@ def register_event_handlers(
             # Set the start node now (after pre-call fetch data is merged)
             # so that render_template() has the complete _call_context_vars.
             await engine.set_node(engine.workflow.start_node_id)
+            startup_latency.mark(workflow_run_id, "system_prompt_loaded")
             await engine.queue_node_opening(
                 node_id=engine.workflow.start_node_id,
                 previous_node_id=None,
                 generate_if_no_greeting=True,
             )
+            startup_latency.mark(workflow_run_id, "greeting_dispatched")
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport, _participant):
         logger.debug("In on_client_connected callback handler")
+        startup_latency.mark(workflow_run_id, "on_client_connected")
         await audio_buffer.start_recording()
         ready_state["client_connected"] = True
         await maybe_trigger_initial_response()
@@ -190,6 +196,7 @@ def register_event_handlers(
     @task.event_handler("on_pipeline_started")
     async def on_pipeline_started(_task: PipelineWorker, _frame: Frame):
         logger.debug("In on_pipeline_started callback handler")
+        startup_latency.mark(workflow_run_id, "on_pipeline_started")
         ready_state["pipeline_started"] = True
         await maybe_trigger_initial_response()
 

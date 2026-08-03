@@ -63,6 +63,7 @@ from api.services.pipecat.service_factory import (
     create_tts_service,
     stt_uses_external_turns,
 )
+from api.services.pipecat import startup_latency
 from api.services.pipecat.tracing_config import (
     ensure_tracing,
 )
@@ -71,6 +72,7 @@ from api.services.pipecat.transport_setup import create_webrtc_transport
 from api.services.pipecat.worker_runner import run_pipeline_worker
 from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
+from api.services.telephony.call_answer_latency import record_first_ai_audio
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
 from api.services.workflow.workflow_graph import WorkflowGraph
@@ -587,6 +589,8 @@ async def _run_pipeline_impl(
     if workflow_run.is_completed:
         raise HTTPException(status_code=400, detail="Workflow run already completed")
 
+    startup_latency.start_tracking(workflow_run_id)
+
     merged_call_context_vars = dict(workflow_run.initial_context or {})
     # If there is some extra call_context_vars, fold them in. Persistence
     # happens once below, after runtime_configuration is also resolved.
@@ -659,6 +663,7 @@ async def _run_pipeline_impl(
     # Create services based on user configuration
     if is_realtime:
         llm = create_realtime_llm_service(user_config, audio_config)
+        startup_latency.mark(workflow_run_id, "llm_created")
         stt = None
         tts = None
         # Realtime services don't implement run_inference, so create a
@@ -675,12 +680,15 @@ async def _run_pipeline_impl(
             keyterms=keyterms,
             correlation_id=mps_correlation_id,
         )
+        startup_latency.mark(workflow_run_id, "stt_created")
         tts = create_tts_service(
             user_config,
             audio_config,
             correlation_id=mps_correlation_id,
         )
+        startup_latency.mark(workflow_run_id, "tts_created")
         llm = create_llm_service(user_config, correlation_id=mps_correlation_id)
+        startup_latency.mark(workflow_run_id, "llm_created")
         inference_llm = None
 
     # Stamp the providers/models actually resolved for this run onto
@@ -717,6 +725,7 @@ async def _run_pipeline_impl(
         ReactFlowDTO.model_validate(run_workflow_json),
         skip_instance_constraints_for={"trigger"},
     )
+    startup_latency.mark(workflow_run_id, "workflow_loaded")
 
     # Pre-call fetch: fire early so it runs concurrently with remaining setup
     pre_call_fetch_task = None
@@ -830,6 +839,7 @@ async def _run_pipeline_impl(
         has_recordings=has_recordings,
         context_compaction_enabled=context_compaction_enabled,
     )
+    startup_latency.mark(workflow_run_id, "engine_created")
 
     # Create pipeline components
     audio_buffer, context = create_pipeline_components(audio_config)
@@ -1034,6 +1044,7 @@ async def _run_pipeline_impl(
             voicemail_detector=voicemail_detector,
             recording_router=recording_router,
         )
+    startup_latency.mark(workflow_run_id, "pipeline_built")
 
     # Create pipeline task with audio configuration
     task = create_pipeline_task(pipeline, workflow_run_id, audio_config)
@@ -1043,6 +1054,27 @@ async def _run_pipeline_impl(
     transcript_log_coordinator.attach_turn_tracking_observer(
         task.turn_tracking_observer
     )
+
+    # Time-to-first-audio: pure measurement, fires once per call on the first
+    # bot utterance. Correlated to the call-answer timestamp (recorded by the
+    # telephony provider, if it reports one) via call_answer_latency's Redis
+    # key — a miss there just means the metric is unavailable for this call.
+    _first_ai_audio_measured = False
+
+    @task.turn_tracking_observer.event_handler("on_bot_started_speaking")
+    async def _measure_first_ai_audio(_observer, _turn_number, _data):
+        nonlocal _first_ai_audio_measured
+        if _first_ai_audio_measured:
+            return
+        _first_ai_audio_measured = True
+        startup_latency.mark(workflow_run_id, "first_audio_sent")
+        startup_latency.finish(workflow_run_id)
+        try:
+            await record_first_ai_audio(workflow_run_id)
+        except Exception as e:
+            logger.warning(
+                f"[run {workflow_run_id}] Failed to record AI start latency: {e}"
+            )
 
     for runtime_session in integration_runtime_sessions:
         runtime_session.attach(task)
@@ -1059,11 +1091,13 @@ async def _run_pipeline_impl(
     # Initialize the engine to set the initial context with
     # System Prompt and Tools
     await engine.initialize()
+    startup_latency.mark(workflow_run_id, "tools_initialized")
 
     # Add real-time feedback observer (always logs to buffer, streams to WS if available)
     feedback_observer = RealtimeFeedbackObserver(
         ws_sender=ws_sender,
         logs_buffer=in_memory_logs_buffer,
+        workflow_run_id=workflow_run_id,
     )
     task.add_observer(feedback_observer)
 
@@ -1125,6 +1159,7 @@ async def _run_pipeline_impl(
     register_audio_data_handler(audio_buffer, workflow_run_id, in_memory_audio_buffer)
 
     try:
+        startup_latency.mark(workflow_run_id, "pipeline_worker_starting")
         # Run the pipeline
         await run_pipeline_worker(task)
         logger.info(f"Task completed for run {workflow_run_id}")

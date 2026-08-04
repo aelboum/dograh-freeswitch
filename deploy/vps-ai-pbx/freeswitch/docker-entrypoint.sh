@@ -105,6 +105,25 @@ find "$TEMPLATES_DIR" -type f | while read -r src; do
     esac
 done
 
+# Disable the stock internal/internal-ipv6/external-ipv6 profiles — only
+# `external` is ever configured or used by this deployment (see
+# RASPBERRY_FREESWITCH_BACKUP.md: "internal — present, stock/unused"). Left
+# in place, sofia.conf.xml's `<X-PRE-PROCESS cmd="include"
+# data="../sip_profiles/*.xml"/>` autoloads all four, and both `internal`
+# and `external` bind sip-ip=$${local_ip_v4} — `internal`'s stock sip-port
+# default (5060) collides with SIP_EXTERNAL_PORT (also 5060), so which one
+# actually wins the bind() race is nondeterministic across restarts. Losing
+# that race silently drops the `external` profile (and every gateway
+# attached to it, e.g. the SIP trunk) with no error at the compose/health-
+# check level — confirmed via a real intermittent registration failure
+# during this deployment's own verification, not theoretical. Removing the
+# files (not just leaving them unreferenced) is what actually stops
+# sofia.conf.xml's glob from picking them up; every start, unconditionally,
+# so this can't regress if the volume already had them from before this fix.
+rm -f "$CONF_DIR/sip_profiles/internal.xml" \
+      "$CONF_DIR/sip_profiles/internal-ipv6.xml" \
+      "$CONF_DIR/sip_profiles/external-ipv6.xml"
+
 # The gateway file's real name comes from SIP_GATEWAY_NAME, not the
 # template's own filename.
 if [ -f "$CONF_DIR/sip_profiles/external/gateway.xml" ]; then

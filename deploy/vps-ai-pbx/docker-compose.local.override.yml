@@ -1,0 +1,22 @@
+# Local-only override: publish api/ui ports to the host so a browser on the
+# LAN can reach them directly (see LOCAL_STAGING_GUIDE.md — ui/src/lib/apiClient.ts
+# has the browser call the API at its own LAN address directly, not proxied
+# through the Next.js server or the cloudflared tunnel, so without this the
+# UI is unreachable from a browser on a local/LAN staging setup).
+#
+# Deliberately NOT part of docker-compose.vps.yml itself: on a real VPS,
+# Docker's `-p` port publishing inserts iptables rules that bypass ufw
+# entirely (a well-known Docker/ufw interaction), which would silently
+# reopen exactly the ports VPS_FIREWALL.md's firewall rules are meant to
+# keep closed. Use this file only for local/LAN staging:
+#
+#   docker compose -f docker-compose.vps.yml -f docker-compose.local.override.yml up -d
+#
+# Never add `-f docker-compose.local.override.yml` on a VPS deployment.
+services:
+  api:
+    ports:
+      - "8000:8000"
+  ui:
+    ports:
+      - "3010:3010"

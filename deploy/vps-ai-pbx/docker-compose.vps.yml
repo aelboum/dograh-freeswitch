@@ -158,6 +158,17 @@ services:
   # as-is rather than redefined (DOGRAH_CURRENT_ARCHITECTURE.md).
   freeswitch-manager:
     image: ${REGISTRY:-dograhai}/dograh-api:latest
+    # Built from the source tree install.sh already checked out (same
+    # rationale as freeswitch's from-source build below), not pulled from
+    # the image: tag above — the published dograhai/dograh-api:latest can
+    # lag behind the repo (e.g. it was observed missing
+    # scripts/run_freeswitch_manager.sh entirely, which this service's
+    # command needs). Building here means this always matches whatever
+    # commit is actually checked out, instead of depending on an
+    # out-of-band registry publish staying in sync with it.
+    build:
+      context: ../..
+      dockerfile: api/Dockerfile
     restart: unless-stopped
     command: ["./scripts/run_freeswitch_manager.sh"]
     environment:
@@ -183,6 +194,11 @@ services:
 
   api:
     image: ${REGISTRY:-dograhai}/dograh-api:latest
+    # See freeswitch-manager's build: comment above — same image, same
+    # from-source rationale.
+    build:
+      context: ../..
+      dockerfile: api/Dockerfile
     restart: unless-stopped
     environment:
       ENVIRONMENT: "${ENVIRONMENT:-production}"
@@ -235,6 +251,10 @@ services:
 
   ui:
     image: ${REGISTRY:-dograhai}/dograh-ui:latest
+    # Same from-source rationale as api/freeswitch-manager above.
+    build:
+      context: ../..
+      dockerfile: ui/Dockerfile
     restart: unless-stopped
     environment:
       HOSTNAME: "0.0.0.0"

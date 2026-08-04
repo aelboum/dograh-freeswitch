@@ -18,6 +18,9 @@ note.
   this way) that everything else builds on.
 - **Ready to deploy?** `VPS_DEPLOYMENT_GUIDE.md` — how to run `install.sh`
   and verify it worked.
+- **Testing on a local PC before a VPS exists?** `LOCAL_STAGING_GUIDE.md` —
+  running this same stack on a Windows/Docker Desktop dev machine as a
+  staging stand-in.
 - **Planning an actual cutover from the Pi?** `MIGRATION_PLAN.md`.
 - **Something broken?** `TROUBLESHOOTING.md`.
 
@@ -38,6 +41,8 @@ note.
 | `SAAS_ROADMAP.md` | Phase 1-5 path from this single-VPS bootstrap deployment to a horizontally-scaled multi-tenant platform |
 | `MIGRATION_PLAN.md` | Sequencing for an actual production cutover from the Pi (not executed yet) |
 | `VPS_DEPLOYMENT_GUIDE.md` | How to run `install.sh` and verify the result |
+| `LOCAL_STAGING_GUIDE.md` | Running this same stack locally on a Windows/Docker Desktop dev PC as a staging stand-in before a VPS exists |
+| `docker-compose.local.override.yml` | Local-only: publishes `api`/`ui` host ports for LAN browser access. Never use on a real VPS — see `LOCAL_STAGING_GUIDE.md` |
 | `BACKUP_RESTORE.md` | How to use `scripts/backup.sh`/`restore.sh`, plus future per-tenant data handling |
 | `TROUBLESHOOTING.md` | SIP registration, no-audio, ESL ACL, TLS/wss, and module-load failure modes |
 

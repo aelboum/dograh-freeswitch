@@ -1,0 +1,20 @@
+<configuration name="acl.conf" description="Network Lists">
+  <network-lists>
+    <!--
+      Bootstrap-tenant ESL allow-list, rendered by docker-entrypoint.sh from
+      DOGRAH_ESL_ALLOWED_CIDRS (comma-separated list of CIDRs — always
+      include the internal Docker network subnet so freeswitch-manager can
+      reach this over ai-pbx-network; see docker-compose.vps.yml).
+
+      This mirrors the exact pattern audited on the source Raspberry Pi
+      (RASPBERRY_FREESWITCH_BACKUP.md): a default="deny" list naming only
+      the hosts allowed to reach ESL. Defense in depth on top of 8021 never
+      being published on the Docker host at all (see ../../../VPS_FIREWALL.md)
+      — not the only barrier.
+    -->
+    <list name="dograh" default="deny">
+      <node type="allow" cidr="127.0.0.1/32"/>
+##DOGRAH_ACL_NODES##
+    </list>
+  </network-lists>
+</configuration>

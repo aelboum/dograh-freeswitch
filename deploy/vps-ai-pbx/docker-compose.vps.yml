@@ -1,0 +1,279 @@
+# AI PBX SaaS-foundation VPS stack — self-contained, single-tenant bootstrap
+# deployment. See ../../ARCHITECTURE.md for the design rationale and
+# VPS_ARCHITECTURE.md for the network diagram this file implements.
+#
+# This file is additive: it does not replace or modify the existing
+# docker-compose.yaml / docker-compose.freeswitch.yml / deploy/hostinger/
+# paths, which continue to work unchanged (see MIGRATION_PLAN.md's backward
+# compatibility note).
+#
+# Usage:
+#   cp .env.example .env   # fill in every value, see .env.example's comments
+#   docker compose -f docker-compose.vps.yml up -d
+#
+# Logging: json-file with size limits on every service (Phase 11 hardening,
+# ARCHITECTURE.md §10) — repeated per-service rather than factored out,
+# since Compose has no top-level default-logging mechanism.
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+      POSTGRES_DB: postgres
+    logging: *default-logging
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - ai-pbx-network
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: >
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    logging: *default-logging
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    networks:
+      - ai-pbx-network
+
+  minio:
+    image: minio/minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}"
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    logging: *default-logging
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-pbx-network
+
+  # Runs FreeSWITCH itself + mod_audio_stream, built from
+  # freeswitch/Dockerfile. See ARCHITECTURE.md §4 ("FreeSWITCH as
+  # infrastructure") — this is the one piece of the stack the existing
+  # docker-compose.freeswitch.yml explicitly does NOT provide (it only adds
+  # freeswitch-manager, expecting an operator-run FreeSWITCH box).
+  freeswitch:
+    build:
+      context: ./freeswitch
+      platforms:
+        - linux/amd64
+    restart: unless-stopped
+    # Docker's default bridge network gives containers only a loopback IPv6
+    # address (::1 on lo), no real interface address. FreeSWITCH's
+    # mod_event_socket resolves its listen address via getaddrinfo(AF_UNSPEC,
+    # AI_ADDRCONFIG) regardless of the configured listen-ip — under
+    # AI_ADDRCONFIG, loopback-only IPv6 doesn't count as "configured" (see
+    # Linux getaddrinfo(3)), causing resolution to fail outright
+    # (a real, still-open upstream bug: signalwire/freeswitch#2941). Fully
+    # disabling IPv6 in this container's network namespace removes the
+    # ambiguity entirely, letting getaddrinfo resolve IPv4-only as intended.
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.lo.disable_ipv6=1
+    environment:
+      PUBLIC_HOST: "${PUBLIC_HOST:?PUBLIC_HOST must be set}"
+      SIP_EXTERNAL_IP: "${SIP_EXTERNAL_IP:?SIP_EXTERNAL_IP must be set}"
+      RTP_PUBLIC_IP: "${RTP_PUBLIC_IP:?RTP_PUBLIC_IP must be set}"
+      SIP_EXTERNAL_PORT: "${SIP_EXTERNAL_PORT:-5060}"
+      SIP_EXTERNAL_TLS_PORT: "${SIP_EXTERNAL_TLS_PORT:-5061}"
+      ESL_PASSWORD: "${ESL_PASSWORD:?ESL_PASSWORD must be set}"
+      DOGRAH_ESL_ALLOWED_CIDRS: "${DOGRAH_ESL_ALLOWED_CIDRS:?DOGRAH_ESL_ALLOWED_CIDRS must be set}"
+      SIP_GATEWAY_NAME: "${SIP_GATEWAY_NAME:?SIP_GATEWAY_NAME must be set}"
+      SIP_GATEWAY_USERNAME: "${SIP_GATEWAY_USERNAME:?SIP_GATEWAY_USERNAME must be set}"
+      SIP_GATEWAY_PASSWORD: "${SIP_GATEWAY_PASSWORD:?SIP_GATEWAY_PASSWORD must be set}"
+      SIP_GATEWAY_REALM: "${SIP_GATEWAY_REALM:?SIP_GATEWAY_REALM must be set}"
+      SIP_GATEWAY_PROXY: "${SIP_GATEWAY_PROXY:?SIP_GATEWAY_PROXY must be set}"
+      RTP_PORT_RANGE_START: "${RTP_PORT_RANGE_START:-20000}"
+      RTP_PORT_RANGE_END: "${RTP_PORT_RANGE_END:-20199}"
+    logging: *default-logging
+    volumes:
+      # /usr/local/freeswitch/etc/freeswitch, NOT .../conf — this build's
+      # real config directory (see docker-entrypoint.sh's comment for why).
+      # First boot copies the image's complete stock tree in; every start
+      # after that, docker-entrypoint.sh re-renders just the bootstrap
+      # subset on top of it — see BACKUP_RESTORE.md for what this volume
+      # is for.
+      - freeswitch-config:/usr/local/freeswitch/etc/freeswitch
+    ports:
+      # SIP + RTP must be public (see VPS_FIREWALL.md). 8021 (ESL) is
+      # deliberately absent from this list — reached only via
+      # ai-pbx-network by service name (freeswitch:8021).
+      #
+      # RTP range is capacity-sized (200 ports by default), NOT the full
+      # 16384-32768 compiled-in default the source Raspberry Pi deployment
+      # uses — publishing 16k+ individual UDP ports over Docker's bridge
+      # networking is impractically slow to start (docker-proxy/iptables
+      # rule setup per port). Widen both this and RTP_PORT_RANGE_START/END
+      # in .env together if concurrent-call capacity ever needs it — see
+      # docker-entrypoint.sh's matching comment and VPS_FIREWALL.md.
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "${RTP_PORT_RANGE_START:-20000}-${RTP_PORT_RANGE_END:-20199}:${RTP_PORT_RANGE_START:-20000}-${RTP_PORT_RANGE_END:-20199}/udp"
+    healthcheck:
+      # CMD-SHELL (not plain CMD array) so $ESL_PASSWORD expands — fs_cli
+      # defaults to password "ClueCon" otherwise, which fails auth against
+      # any real (non-default) ESL_PASSWORD and reports as a connection
+      # error indistinguishable from ESL actually being down. This
+      # compose-level healthcheck overrides the Dockerfile's own
+      # HEALTHCHECK, so both must carry this fix — see freeswitch/Dockerfile.
+      test: ["CMD-SHELL", "fs_cli -p \"$ESL_PASSWORD\" -x status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - ai-pbx-network
+
+  # ESL listener connecting to the freeswitch service above over the
+  # internal network — same image/command as the existing
+  # docker-compose.freeswitch.yml's freeswitch-manager service, reused
+  # as-is rather than redefined (DOGRAH_CURRENT_ARCHITECTURE.md).
+  freeswitch-manager:
+    image: ${REGISTRY:-dograhai}/dograh-api:latest
+    restart: unless-stopped
+    command: ["./scripts/run_freeswitch_manager.sh"]
+    environment:
+      ENVIRONMENT: "${ENVIRONMENT:-production}"
+      LOG_LEVEL: "INFO"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-}"
+      PUBLIC_HOST: "${PUBLIC_HOST:-}"
+      BACKEND_API_ENDPOINT: "${BACKEND_API_ENDPOINT:-${AI_BACKEND_URL:-}}"
+      DATABASE_URL: "postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET must be set}"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      freeswitch:
+        condition: service_healthy
+    networks:
+      - ai-pbx-network
+
+  api:
+    image: ${REGISTRY:-dograhai}/dograh-api:latest
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: "${ENVIRONMENT:-production}"
+      LOG_LEVEL: "INFO"
+      ENABLE_SIGNUP: "${ENABLE_SIGNUP:-true}"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-}"
+      PUBLIC_HOST: "${PUBLIC_HOST:-}"
+      BACKEND_API_ENDPOINT: "${BACKEND_API_ENDPOINT:-${AI_BACKEND_URL:-}}"
+      DATABASE_URL: "postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
+      ENABLE_AWS_S3: "${ENABLE_AWS_S3:-false}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+      S3_BUCKET: "${S3_BUCKET:-}"
+      S3_REGION: "${S3_REGION:-us-east-1}"
+      S3_ENDPOINT_URL: "${S3_ENDPOINT_URL:-}"
+      S3_SIGNATURE_VERSION: "${S3_SIGNATURE_VERSION:-}"
+      S3_ADDRESSING_STYLE: "${S3_ADDRESSING_STYLE:-}"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT:-}"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+      FASTAPI_WORKERS: "${FASTAPI_WORKERS:-1}"
+      FORWARDED_ALLOW_IPS: "*"
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET must be set}"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8000/api/v1/health'').read()"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - ai-pbx-network
+
+  ui:
+    image: ${REGISTRY:-dograhai}/dograh-ui:latest
+    restart: unless-stopped
+    environment:
+      HOSTNAME: "0.0.0.0"
+      BACKEND_URL: "${BACKEND_URL:-http://api:8000}"
+      NODE_ENV: "oss"
+      ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"
+    logging: *default-logging
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://127.0.0.1:3010 || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - ai-pbx-network
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:-}"
+    command: ${CLOUDFLARED_COMMAND:-tunnel --url http://api:8000 --metrics 0.0.0.0:2000}
+    logging: *default-logging
+    networks:
+      - ai-pbx-network
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  freeswitch-config:
+
+networks:
+  ai-pbx-network:
+    driver: bridge

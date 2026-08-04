@@ -1,0 +1,22 @@
+<include>
+  <!--
+    Bootstrap inbound dialplan: park() every inbound call so Dograh's ESL
+    manager (esl_manager.py, observing CHANNEL_PARK) takes control — this is
+    the exact prerequisite documented in
+    api/services/telephony/providers/freeswitch/OPERATOR_GUIDE.md step 1,
+    and matches what's live on the source Raspberry Pi deployment
+    (RASPBERRY_FREESWITCH_BACKUP.md).
+
+    This bootstrap deployment has exactly one trunk/one tenant, so a
+    catch-all match is fine — Dograh's own phone-number-to-workflow binding
+    (telephony_phone_numbers.inbound_workflow_id) does the actual per-DID
+    routing on the application side, not FreeSWITCH's dialplan. To restrict
+    to a specific DID instead, replace destination_number's expression with
+    e.g. ^(YOUR_DID)$ per OPERATOR_GUIDE.md.
+  -->
+  <extension name="dograh-inbound">
+    <condition field="destination_number" expression="^.*$">
+      <action application="park"/>
+    </condition>
+  </extension>
+</include>

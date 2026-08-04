@@ -1,0 +1,8 @@
+<include>
+  <context name="public">
+    <!-- Includes every extension file under dialplan/public/, matching the
+         layout audited on the source Raspberry Pi deployment
+         (RASPBERRY_FREESWITCH_BACKUP.md). -->
+    <X-PRE-PROCESS cmd="include" data="public/*.xml"/>
+  </context>
+</include>

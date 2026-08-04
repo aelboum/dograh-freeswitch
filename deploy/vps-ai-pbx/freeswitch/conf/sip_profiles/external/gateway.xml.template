@@ -1,0 +1,21 @@
+<include>
+  <!--
+    Single bootstrap SIP trunk for this initial deployment — see
+    ARCHITECTURE.md §4a: this is explicitly NOT the pattern for onboarding
+    future customers. Real per-tenant gateways belong in Postgres
+    (telephony_configurations), provisioned through the app and rendered by
+    the future Configuration Service (ARCHITECTURE.md §4b), not added here
+    as additional env vars.
+  -->
+  <gateway name="${SIP_GATEWAY_NAME}">
+    <param name="username" value="${SIP_GATEWAY_USERNAME}"/>
+    <param name="realm" value="${SIP_GATEWAY_REALM}"/>
+    <param name="password" value="${SIP_GATEWAY_PASSWORD}"/>
+    <param name="proxy" value="${SIP_GATEWAY_PROXY}"/>
+    <param name="register" value="true"/>
+    <param name="expire-seconds" value="1800"/>
+    <param name="retry-seconds" value="30"/>
+    <param name="caller-id-in-from" value="true"/>
+    <param name="ping" value="25"/>
+  </gateway>
+</include>

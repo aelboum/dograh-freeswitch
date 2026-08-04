@@ -1,0 +1,37 @@
+<include>
+  <!--
+    Bootstrap config, rendered from environment variables at container start
+    by docker-entrypoint.sh — see ARCHITECTURE.md §4a for the bootstrap-vs-
+    tenant-runtime-config split this implements. Do not hand-edit the
+    rendered conf/vars.xml inside a running container; change the env var in
+    .env and restart instead, or it will be overwritten on the next restart.
+  -->
+  <X-PRE-PROCESS cmd="set" data="domain=${PUBLIC_HOST}"/>
+  <X-PRE-PROCESS cmd="set" data="domain_name=$${domain}"/>
+
+  <!-- Audio-only subset of the codec preference audited on the source
+       Raspberry Pi deployment (RASPBERRY_FREESWITCH_BACKUP.md) — this is a
+       voice AI PBX, so the video codecs (H264/VP8) the Pi listed are
+       dropped here since mod_av/mod_vpx aren't in this image's module set
+       (see freeswitch-modules.conf) and listing codecs with no backing
+       module is dead config, not a real capability. -->
+  <X-PRE-PROCESS cmd="set" data="global_codec_prefs=OPUS,G722,PCMU,PCMA"/>
+  <X-PRE-PROCESS cmd="set" data="outbound_codec_prefs=OPUS,G722,PCMU,PCMA"/>
+
+  <X-PRE-PROCESS cmd="set" data="bind_server_ip=auto"/>
+
+  <!-- Real public IPs on a VPS — no STUN indirection needed, unlike the
+       Pi's LAN-only, no-public-IP setup. -->
+  <X-PRE-PROCESS cmd="set" data="external_rtp_ip=${RTP_PUBLIC_IP}"/>
+  <X-PRE-PROCESS cmd="set" data="external_sip_ip=${SIP_EXTERNAL_IP}"/>
+
+  <!-- envsubst has no default-value syntax; docker-entrypoint.sh exports
+       SIP_EXTERNAL_PORT/SIP_EXTERNAL_TLS_PORT with defaults before rendering
+       this template, so both are always set by the time this substitutes. -->
+  <X-PRE-PROCESS cmd="set" data="external_sip_port=${SIP_EXTERNAL_PORT}"/>
+  <X-PRE-PROCESS cmd="set" data="external_tls_port=${SIP_EXTERNAL_TLS_PORT}"/>
+
+  <X-PRE-PROCESS cmd="set" data="default_provider_from_domain=$${domain}"/>
+  <X-PRE-PROCESS cmd="set" data="hold_music=local_stream://moh"/>
+  <X-PRE-PROCESS cmd="set" data="sound_prefix=$${base_dir}/sounds/en/us/callie"/>
+</include>
